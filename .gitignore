@@ -1,0 +1,44 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build artifacts
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Django runtime data
+db.sqlite3
+db.sqlite3-journal
+instance/
+/staticfiles/
+/media/
+
+# Environment files (keep the example committed)
+.env
+.env.*
+!.env.example
+
+# Caches / testing / coverage
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Logs
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

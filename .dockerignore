@@ -1,0 +1,37 @@
+# Local secrets - never bake these into the image
+.env
+.env.*
+
+# Python caches / virtual envs
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local runtime data
+instance/
+staticfiles/
+*.db
+*.sqlite3
+
+# Testing / tooling
+.pytest_cache/
+.cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# VCS / editors / OS
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
