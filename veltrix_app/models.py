@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from django.conf import settings
 from django.contrib.auth.models import AbstractUser
 from django.db import models
 from django.utils import timezone
-from django.conf import settings
 
 
 class User(AbstractUser):
@@ -138,28 +138,58 @@ class Conversation(models.Model):
     """
     Conversation between a client (user) and support/admins.
     """
+
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="conversations")
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="assigned_conversations",
+        null=True,
+        blank=True,
+    )
     subject = models.CharField(max_length=160, blank=True, default="General Support")
     is_active = models.BooleanField(default=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         ordering = ["-updated_at"]
+        indexes = [
+            models.Index(fields=["user", "is_active"]),
+            models.Index(fields=["assigned_to", "is_active"]),
+            models.Index(fields=["updated_at"]),
+        ]
 
     def __str__(self):
         return f"Conversation({self.id}) user={self.user_id} subject={self.subject}"
 
+    @property
+    def is_closed(self):
+        return not self.is_active
+
+    def unread_count_for(self, user):
+        if not user or not user.is_authenticated:
+            return 0
+        qs = self.messages.exclude(sender=user).filter(is_read=False)
+        if user.is_staff or user.is_admin():
+            return qs.count()
+        return qs.filter(sender__is_staff=False).count() if user == self.user else 0
+
 
 class Message(models.Model):
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name="messages")
-    sender = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    sender = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="sent_messages")
     content = models.TextField()
     is_read = models.BooleanField(default=False)
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         ordering = ["created_at"]
+        indexes = [
+            models.Index(fields=["conversation", "is_read"]),
+            models.Index(fields=["conversation", "created_at"]),
+        ]
 
     def __str__(self):
         return f"Message({self.id}) conv={self.conversation_id} sender={self.sender_id}"
