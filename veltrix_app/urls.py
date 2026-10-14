@@ -6,7 +6,6 @@ from .views import (
     admin_portal_view,
     dashboard_view,
     health_check,
-    instrument_api,
     logout_view,
     market_view,
     portfolio_view,
@@ -26,5 +25,4 @@ urlpatterns = [
     path("support/", support_view, name="support"),
     path("admin-portal/", admin_portal_view, name="admin_portal"),
     path("health/", health_check, name="health"),
-    path("api/instruments/", instrument_api, name="api_instruments"),
 ]
