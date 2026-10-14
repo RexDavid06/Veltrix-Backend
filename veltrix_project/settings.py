@@ -20,13 +20,28 @@ DEBUG = os.environ.get("DEBUG", "1") == "1"
 # localhost and the known Render hostname for this deployment. Prefer an
 # explicitly-provided ALLOWED_HOSTS so operators can override or add hosts.
 _raw_allowed = os.environ.get("ALLOWED_HOSTS")
+# Render provides RENDER_EXTERNAL_HOSTNAME in some environments; prefer adding
+# it when present so the deployment's external hostname is always allowed.
+_render_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 if _raw_allowed:
     ALLOWED_HOSTS = [item.strip() for item in _raw_allowed.split(",") if item.strip()]
+    # Ensure the Render-provided host is present when available.
+    if _render_host and _render_host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_render_host)
 else:
-    # Render provides RENDER_EXTERNAL_HOSTNAME in some environments; prefer that
-    # if present. Otherwise include the deployment host used for this project.
-    _render_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "veltrix-backend-5cwa.onrender.com"
+    # If no explicit ALLOWED_HOSTS are provided, include localhost + Render
+    # hostname (or the known deployment hostname as a safe fallback).
+    _render_host = _render_host or "veltrix-backend-5cwa.onrender.com"
     ALLOWED_HOSTS = ["127.0.0.1", "localhost", _render_host]
+
+# Deduplicate while preserving order to avoid accidental duplicates from env + render
+_seen = set()
+_deduped = []
+for _h in ALLOWED_HOSTS:
+    if _h not in _seen:
+        _seen.add(_h)
+        _deduped.append(_h)
+ALLOWED_HOSTS = _deduped
 
 # Security: require SECRET_KEY in production
 if not DEBUG and SECRET_KEY == "dev-insecure-secret-change-me":
