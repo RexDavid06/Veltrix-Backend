@@ -15,7 +15,18 @@ environ.Env.read_env(BASE_DIR / ".env")
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-me")
 DEBUG = os.environ.get("DEBUG", "1") == "1"
-ALLOWED_HOSTS = [item.strip() for item in os.environ.get("ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if item.strip()]
+# Read ALLOWED_HOSTS from the environment (comma-separated). If the variable is
+# not provided (e.g. Render dashboard), fall back to a safe default that keeps
+# localhost and the known Render hostname for this deployment. Prefer an
+# explicitly-provided ALLOWED_HOSTS so operators can override or add hosts.
+_raw_allowed = os.environ.get("ALLOWED_HOSTS")
+if _raw_allowed:
+    ALLOWED_HOSTS = [item.strip() for item in _raw_allowed.split(",") if item.strip()]
+else:
+    # Render provides RENDER_EXTERNAL_HOSTNAME in some environments; prefer that
+    # if present. Otherwise include the deployment host used for this project.
+    _render_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "veltrix-backend-5cwa.onrender.com"
+    ALLOWED_HOSTS = ["127.0.0.1", "localhost", _render_host]
 
 # Security: require SECRET_KEY in production
 if not DEBUG and SECRET_KEY == "dev-insecure-secret-change-me":
