@@ -1,0 +1,8 @@
+{
+  "name": "VELTRIX Backend",
+  "description": "Django REST Framework backend for the VELTRIX trading platform with JWT authentication, support conversations, and market data.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

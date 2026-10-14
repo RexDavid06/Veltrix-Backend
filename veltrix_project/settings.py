@@ -41,6 +41,8 @@ for _h in ALLOWED_HOSTS:
     if _h not in _seen:
         _seen.add(_h)
         _deduped.append(_h)
+if DEBUG and "*" not in _deduped:
+    _deduped.append("*")
 ALLOWED_HOSTS = _deduped
 
 # Security: require SECRET_KEY in production
@@ -105,7 +107,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL:
     DATABASES = {"default": dj_database_url.parse(DATABASE_URL, conn_max_age=600)}
 else:
-    DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": BASE_DIR / "instance" / "veltrix.db"}}
+    instance_dir = BASE_DIR / "instance"
+    instance_dir.mkdir(parents=True, exist_ok=True)
+    DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": instance_dir / "veltrix.db"}}
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -123,7 +127,7 @@ USE_TZ = True
 # Static files (production)
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
-STATICFILES_DIRS = [BASE_DIR / "static"]
+STATICFILES_DIRS = [BASE_DIR / "static"] if (BASE_DIR / "static").exists() else []
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
