@@ -59,6 +59,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "rest_framework",
     "rest_framework_simplejwt",
+    "channels",
 
     # local
     "veltrix_app",
@@ -207,3 +208,17 @@ LOGGING = {
     },
     "root": {"handlers": ["console"], "level": LOG_LEVEL},
 }
+
+# Channels / Redis
+REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [REDIS_URL],
+        },
+    }
+}
+
+# Admin support emails (comma-separated)
+SUPPORT_ADMIN_EMAILS = [e.strip() for e in os.environ.get("SUPPORT_ADMIN_EMAILS", "").split(",") if e.strip()]
