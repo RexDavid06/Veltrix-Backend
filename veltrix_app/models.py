@@ -5,6 +5,7 @@ from decimal import Decimal
 from django.contrib.auth.models import AbstractUser
 from django.db import models
 from django.utils import timezone
+from django.conf import settings
 
 
 class User(AbstractUser):
@@ -130,3 +131,35 @@ class AuditLog(models.Model):
 
     def __str__(self):
         return f"{self.action} @ {self.created_at.isoformat()}"
+
+
+# --- Support chat models ---
+class Conversation(models.Model):
+    """
+    Conversation between a client (user) and support/admins.
+    """
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="conversations")
+    subject = models.CharField(max_length=160, blank=True, default="General Support")
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return f"Conversation({self.id}) user={self.user_id} subject={self.subject}"
+
+
+class Message(models.Model):
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name="messages")
+    sender = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    content = models.TextField()
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"Message({self.id}) conv={self.conversation_id} sender={self.sender_id}"
