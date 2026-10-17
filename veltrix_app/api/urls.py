@@ -1,5 +1,5 @@
 from django.urls import path
-from rest_framework_simplejwt.views import TokenRefreshView
+from rest_framework_simplejwt.views import TokenBlacklistView, TokenRefreshView
 
 from .views import (
     AssignConversationAPIView,
@@ -36,6 +36,7 @@ urlpatterns = [
     path("auth/register/", RegisterAPIView.as_view(), name="api_register"),
     path("auth/token/", EmailTokenObtainPairView.as_view(), name="token_obtain_pair"),
     path("auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
+    path("auth/logout/", TokenBlacklistView.as_view(), name="token_blacklist"),
     path("profile/", ProfileAPIView.as_view(), name="api_profile"),
     path("dashboard/", DashboardAPIView.as_view(), name="api_dashboard"),
     path("support/", SupportTicketAPIView.as_view(), name="api_support"),

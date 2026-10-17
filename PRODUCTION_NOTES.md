@@ -19,7 +19,7 @@ Important environment variables to set in production:
 - FRONTEND_URL (used to construct email verification links)
 
 Notes and next steps
-- You should run `python manage.py migrate` after deploying the image.
+- Migrations run automatically when the container starts (the Dockerfile CMD runs `python manage.py migrate --noinput` before gunicorn), so no manual migrate step is needed after deploying the image. This is required on Render, where the instance disk is recreated on every deploy.
 - Create a superuser using `python manage.py createsuperuser` for admin access.
 - The email verification uses Django's signing utilities and a front-end URL `FRONTEND_URL` where a verification route should exist to consume the token and call the verify endpoint.
 - Consider adding a background worker (Celery + Redis) if you plan to poll market providers continuously.

@@ -350,9 +350,16 @@ class OrderAPIView(APIView):
             )
 
         cost = (price * quantity).quantize(Decimal("0.01"))
-        account, _ = DemoAccount.objects.get_or_create(user=request.user, defaults={"currency": "USD", "cash_balance": "0.00"})
 
         with transaction.atomic():
+            account, _ = DemoAccount.objects.get_or_create(
+                user=request.user, defaults={"currency": "USD", "cash_balance": "0.00"}
+            )
+            # Lock the balance row for the rest of the transaction so two
+            # concurrent orders cannot both read the same starting balance and
+            # overspend (a no-op on SQLite, effective on Postgres).
+            account = DemoAccount.objects.select_for_update().get(pk=account.pk)
+
             if side == "buy":
                 if account.cash_balance < cost:
                     return Response(
@@ -430,9 +437,12 @@ class TopUpAPIView(APIView):
             return Response({"detail": "amount exceeds the demo top-up limit"}, status=status.HTTP_400_BAD_REQUEST)
 
         amount = amount.quantize(Decimal("0.01"))
-        account, _ = DemoAccount.objects.get_or_create(user=request.user, defaults={"currency": "USD", "cash_balance": "0.00"})
 
         with transaction.atomic():
+            account, _ = DemoAccount.objects.get_or_create(
+                user=request.user, defaults={"currency": "USD", "cash_balance": "0.00"}
+            )
+            account = DemoAccount.objects.select_for_update().get(pk=account.pk)
             account.cash_balance = account.cash_balance + amount
             account.save(update_fields=["cash_balance"])
             tx = Transaction.objects.create(

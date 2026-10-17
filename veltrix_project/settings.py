@@ -62,6 +62,9 @@ INSTALLED_APPS = [
     "corsheaders",
     "rest_framework",
     "rest_framework_simplejwt",
+    # Enables refresh-token blacklisting so rotation actually invalidates the
+    # previous refresh token and logout can revoke a session server-side.
+    "rest_framework_simplejwt.token_blacklist",
     "channels",
 
     # local
@@ -166,15 +169,20 @@ DEFAULT_MARKET_SYMBOLS = [
     "XAUUSD=X",
 ]
 
-# CORS - default to the local Vite dev server plus the known Render frontend
-# origin so the deployed SPA can reach the API even if CORS_ALLOWED_ORIGINS is
-# not explicitly configured. Operators can override via the environment.
-_default_cors_origins = ",".join([
+# CORS - the deployed SPA and both local dev servers must always be allowed.
+# Known app origins are MERGED with (not replaced by) CORS_ALLOWED_ORIGINS, so a
+# stale or restrictive environment value can never break login/registration in
+# production: without an Access-Control-Allow-Origin header the browser blocks
+# the response and axios reports a bare "Network Error".
+_default_cors_origins = [
     "http://127.0.0.1:5173",
     "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
     "https://veltrix-frontend-9mc7.onrender.com",
-])
-CORS_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", _default_cors_origins).split(",") if o.strip()]
+]
+_env_cors_origins = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+CORS_ALLOWED_ORIGINS = list(dict.fromkeys([*_default_cors_origins, *_env_cors_origins]))
 CORS_ALLOW_CREDENTIALS = True
 
 # CSRF trusted origins (used by the Django admin / session views in production).
@@ -206,6 +214,9 @@ SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
     "ROTATE_REFRESH_TOKENS": True,
+    # Blacklist the rotated-out refresh token. Without this, ROTATE_REFRESH_TOKENS
+    # alone leaves the old token valid until it naturally expires.
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 
 # Running the test suite: disable caching so DRF's anon throttle (20/min) never
