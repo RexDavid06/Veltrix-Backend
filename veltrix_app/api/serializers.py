@@ -142,11 +142,24 @@ class ConversationListSerializer(serializers.ModelSerializer):
         fields = ("id", "subject", "is_active", "assigned_to", "created_at", "updated_at", "unread_count", "last_message", "messages")
 
     def get_unread_count(self, obj):
+        # The list view annotates this to avoid one COUNT query per conversation.
+        annotated = getattr(obj, "unread_count", None)
+        if annotated is not None:
+            return annotated
         user = self.context.get("request").user
         return obj.messages.exclude(sender=user).filter(is_read=False).count()
 
+    def _prefetched(self, obj):
+        # The list view prefetches recent messages once for all conversations;
+        # fall back to a query when the serializer is used elsewhere.
+        return getattr(obj, "prefetched_messages", None)
+
     def get_last_message(self, obj):
-        msg = obj.messages.order_by("-created_at").first()
+        recent = self._prefetched(obj)
+        if recent is not None:
+            msg = recent[0] if recent else None
+        else:
+            msg = obj.messages.order_by("-created_at").first()
         if not msg:
             return None
         return {"id": msg.id, "sender": msg.sender_id, "content": msg.content, "created_at": msg.created_at}
@@ -155,8 +168,10 @@ class ConversationListSerializer(serializers.ModelSerializer):
         # Include a bounded recent history so the client/admin thread views can
         # render message history from the list endpoint (the frontend reads
         # conversation.messages for each thread).
-        recent = obj.messages.select_related("sender").order_by("-created_at")[:100]
-        ordered = list(reversed(recent))
+        recent = self._prefetched(obj)
+        if recent is None:
+            recent = list(obj.messages.select_related("sender").order_by("-created_at")[:100])
+        ordered = list(reversed(recent[:100]))
         return MessageSerializer(ordered, many=True, context=self.context).data
 
 

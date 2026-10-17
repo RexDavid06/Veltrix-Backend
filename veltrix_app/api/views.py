@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
+from django.db.models import Count, Prefetch, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, permissions, status
@@ -135,10 +136,23 @@ class ConversationsListCreateAPIView(APIView):
 
     def get(self, request):
         user = request.user
-        if user.is_staff or user.is_admin():
-            qs = Conversation.objects.select_related("user", "assigned_to").order_by("-updated_at")
-        else:
-            qs = Conversation.objects.filter(user=user).select_related("user", "assigned_to").order_by("-updated_at")
+        qs = Conversation.objects.select_related("user", "assigned_to").order_by("-updated_at")
+        if not (user.is_staff or user.is_admin()):
+            qs = qs.filter(user=user)
+        # One aggregate for unread counts and one prefetch for all messages,
+        # instead of three queries per conversation (unread/last/messages).
+        qs = qs.annotate(
+            unread_count=Count(
+                "messages",
+                filter=~Q(messages__sender=user) & Q(messages__is_read=False),
+            )
+        ).prefetch_related(
+            Prefetch(
+                "messages",
+                queryset=Message.objects.select_related("sender").order_by("-created_at"),
+                to_attr="prefetched_messages",
+            )
+        )
         serializer = ConversationListSerializer(qs, many=True, context={"request": request})
         return Response(serializer.data)
 
@@ -338,6 +352,10 @@ class OrderAPIView(APIView):
             quantity = Decimal(str(quantity_raw))
         except (InvalidOperation, TypeError, ValueError):
             return Response({"detail": "quantity must be a number"}, status=status.HTTP_400_BAD_REQUEST)
+        # Decimal("nan")/("inf") parse without raising and compare as False, so
+        # they must be rejected explicitly or they corrupt the balance (500).
+        if not quantity.is_finite():
+            return Response({"detail": "quantity must be a finite number"}, status=status.HTTP_400_BAD_REQUEST)
         if quantity <= 0:
             return Response({"detail": "quantity must be greater than zero"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -349,7 +367,10 @@ class OrderAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        cost = (price * quantity).quantize(Decimal("0.01"))
+        try:
+            cost = (price * quantity).quantize(Decimal("0.01"))
+        except InvalidOperation:
+            return Response({"detail": "quantity is out of range"}, status=status.HTTP_400_BAD_REQUEST)
 
         with transaction.atomic():
             account, _ = DemoAccount.objects.get_or_create(
@@ -431,12 +452,17 @@ class TopUpAPIView(APIView):
             amount = Decimal(str(request.data.get("amount")))
         except (InvalidOperation, TypeError, ValueError):
             return Response({"detail": "amount must be a number"}, status=status.HTTP_400_BAD_REQUEST)
+        if not amount.is_finite():
+            return Response({"detail": "amount must be a finite number"}, status=status.HTTP_400_BAD_REQUEST)
         if amount <= 0:
             return Response({"detail": "amount must be greater than zero"}, status=status.HTTP_400_BAD_REQUEST)
         if amount > self.MAX_DEMO_TOPUP:
             return Response({"detail": "amount exceeds the demo top-up limit"}, status=status.HTTP_400_BAD_REQUEST)
 
-        amount = amount.quantize(Decimal("0.01"))
+        try:
+            amount = amount.quantize(Decimal("0.01"))
+        except InvalidOperation:
+            return Response({"detail": "amount is out of range"}, status=status.HTTP_400_BAD_REQUEST)
 
         with transaction.atomic():
             account, _ = DemoAccount.objects.get_or_create(
