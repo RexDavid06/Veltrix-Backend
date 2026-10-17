@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import sys
 import environ
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
@@ -140,6 +141,12 @@ CSRF_COOKIE_SECURE = not DEBUG
 SECURE_SSL_REDIRECT = not DEBUG
 SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
 
+# Production runs behind a TLS-terminating reverse proxy (Render), which forwards
+# the original scheme via X-Forwarded-Proto. Without this, request.is_secure()
+# stays False while SECURE_SSL_REDIRECT is on, causing an infinite redirect loop
+# that breaks login/admin and prevents secure cookies from ever being set.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
 if not DEBUG:
     # Additional production hardening
     SECURE_HSTS_SECONDS = int(os.environ.get("SECURE_HSTS_SECONDS", 31536000))
@@ -159,9 +166,23 @@ DEFAULT_MARKET_SYMBOLS = [
     "XAUUSD=X",
 ]
 
-# CORS
-CORS_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://127.0.0.1:5173").split(",") if o.strip()]
+# CORS - default to the local Vite dev server plus the known Render frontend
+# origin so the deployed SPA can reach the API even if CORS_ALLOWED_ORIGINS is
+# not explicitly configured. Operators can override via the environment.
+_default_cors_origins = ",".join([
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "https://veltrix-frontend-9mc7.onrender.com",
+])
+CORS_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", _default_cors_origins).split(",") if o.strip()]
 CORS_ALLOW_CREDENTIALS = True
+
+# CSRF trusted origins (used by the Django admin / session views in production).
+_raw_csrf = os.environ.get("CSRF_TRUSTED_ORIGINS", "")
+if _raw_csrf:
+    CSRF_TRUSTED_ORIGINS = [o.strip() for o in _raw_csrf.split(",") if o.strip()]
+else:
+    CSRF_TRUSTED_ORIGINS = [f"https://{h}" for h in ALLOWED_HOSTS if h not in ("*", "127.0.0.1", "localhost")]
 
 # DRF and authentication
 REST_FRAMEWORK = {
@@ -186,6 +207,11 @@ SIMPLE_JWT = {
     "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
     "ROTATE_REFRESH_TOKENS": True,
 }
+
+# Running the test suite: disable caching so DRF's anon throttle (20/min) never
+# trips while tests accumulate requests across a run that can exceed a minute.
+if "test" in sys.argv:
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.dummy.DummyCache"}}
 
 # Email (send only if configured) - keep defaults to console for dev
 EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend")
