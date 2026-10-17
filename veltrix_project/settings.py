@@ -132,7 +132,15 @@ USE_TZ = True
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_DIRS = [BASE_DIR / "static"] if (BASE_DIR / "static").exists() else []
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+# STATICFILES_STORAGE was removed in Django 5.1 in favour of STORAGES; the old
+# setting was silently ignored, so this restores the intended compressed+hashed
+# static storage. WHITENOISE_MANIFEST_STRICT=False keeps a missing manifest
+# entry from turning into a 500 (it falls back to the unhashed path).
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
+}
+WHITENOISE_MANIFEST_STRICT = False
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 AUTH_USER_MODEL = "veltrix_app.User"
@@ -155,7 +163,6 @@ if not DEBUG:
     SECURE_HSTS_SECONDS = int(os.environ.get("SECURE_HSTS_SECONDS", 31536000))
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
-    SECURE_BROWSER_XSS_FILTER = True
     X_FRAME_OPTIONS = "DENY"
 
 MARKET_USE_LIVE = os.environ.get("MARKET_USE_LIVE", "0") == "1"
