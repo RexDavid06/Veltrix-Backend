@@ -61,11 +61,31 @@ class RegisterAPIView(generics.CreateAPIView):
 
 
 class ProfileAPIView(APIView):
+    """Read and update the authenticated user's own profile.
+
+    Only first_name, last_name and email are writable (enforced by
+    UserProfileSerializer's read-only fields and update()). Privileged fields
+    such as is_staff, role and is_verified can never be changed here, and the
+    endpoint only ever operates on request.user.
+    """
+
     permission_classes = (permissions.IsAuthenticated,)
 
     def get(self, request):
         serializer = UserProfileSerializer(request.user)
         return Response(serializer.data)
+
+    def patch(self, request):
+        serializer = UserProfileSerializer(request.user, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(UserProfileSerializer(request.user).data)
+
+    def put(self, request):
+        serializer = UserProfileSerializer(request.user, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(UserProfileSerializer(request.user).data)
 
 
 class DashboardAPIView(APIView):

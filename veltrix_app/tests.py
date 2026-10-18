@@ -1,6 +1,12 @@
+import os
 from decimal import Decimal
+from io import StringIO
+from unittest import mock
+
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import TestCase
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
@@ -381,3 +387,307 @@ class ConversationMessageContractTests(TestCase):
         # sender is a nested object so the UI can distinguish self vs staff
         self.assertIn("is_staff", convo["messages"][0]["sender"])
         self.assertEqual(convo["messages"][0]["sender"]["id"], self.user.id)
+
+
+class EnsureSuperuserCommandTests(TestCase):
+    """The one-time admin creation command used by the GitHub Actions workflow."""
+
+    PASSWORD = "AdminPass123!"
+
+    def test_creates_admin_from_environment_variables(self):
+        env = {
+            "DJANGO_SUPERUSER_EMAIL": "Root@Example.com",
+            "DJANGO_SUPERUSER_PASSWORD": self.PASSWORD,
+        }
+        with mock.patch.dict(os.environ, env):
+            call_command("ensure_superuser")
+
+        user = User.objects.get(email="root@example.com")
+        self.assertEqual(user.username, "root@example.com")
+        self.assertEqual(user.role, User.Role.ADMIN)
+        self.assertTrue(user.is_staff)
+        self.assertTrue(user.is_superuser)
+        self.assertTrue(user.is_verified)
+        self.assertTrue(user.is_active)
+        self.assertTrue(user.check_password(self.PASSWORD))
+        self.assertEqual(User.objects.count(), 1)
+
+    def test_username_defaults_to_lowercased_email(self):
+        call_command("ensure_superuser", email="Admin2@Example.com", password=self.PASSWORD)
+        user = User.objects.get()
+        self.assertEqual(user.username, "admin2@example.com")
+        self.assertEqual(user.email, "admin2@example.com")
+
+    def test_rerun_reports_exists_without_changing_anything(self):
+        call_command("ensure_superuser", email="keep@example.com", password=self.PASSWORD)
+        original = User.objects.get(username="keep@example.com")
+
+        out = StringIO()
+        call_command(
+            "ensure_superuser",
+            email="keep@example.com",
+            password="TotallyDifferent1!",
+            stdout=out,
+        )
+
+        original.refresh_from_db()
+        self.assertEqual(User.objects.count(), 1)
+        # Password must NOT be reset and permissions must NOT change on rerun.
+        self.assertTrue(original.check_password(self.PASSWORD))
+        self.assertFalse(original.check_password("TotallyDifferent1!"))
+        self.assertEqual(original.role, User.Role.ADMIN)
+        self.assertTrue(original.is_staff)
+        self.assertTrue(original.is_superuser)
+        self.assertIn("already exists", out.getvalue())
+
+    def test_existing_non_admin_account_is_not_modified(self):
+        victim = User.objects.create_user(
+            username="ordinary@example.com",
+            email="ordinary@example.com",
+            password="UserPass123!",
+        )
+        with self.assertRaises(CommandError) as ctx:
+            call_command(
+                "ensure_superuser",
+                email="ordinary@example.com",
+                password=self.PASSWORD,
+            )
+
+        message = str(ctx.exception)
+        self.assertIn("already exists", message)
+        self.assertIn("Nothing was changed", message)
+
+        victim.refresh_from_db()
+        self.assertEqual(User.objects.count(), 1)
+        self.assertEqual(victim.role, User.Role.CLIENT)
+        self.assertFalse(victim.is_staff)
+        self.assertFalse(victim.is_superuser)
+        self.assertFalse(victim.is_verified)
+        self.assertTrue(victim.is_active)
+        self.assertTrue(victim.check_password("UserPass123!"))
+
+    def test_partial_admin_is_not_silently_promoted(self):
+        partial = User.objects.create_user(
+            username="partial@example.com",
+            email="partial@example.com",
+            password="UserPass123!",
+            role=User.Role.ADMIN,
+        )
+        self.assertFalse(partial.is_staff)
+        self.assertFalse(partial.is_superuser)
+
+        with self.assertRaises(CommandError) as ctx:
+            call_command(
+                "ensure_superuser",
+                email="partial@example.com",
+                password=self.PASSWORD,
+            )
+        self.assertIn("Nothing was changed", str(ctx.exception))
+
+        partial.refresh_from_db()
+        self.assertEqual(User.objects.count(), 1)
+        self.assertEqual(partial.role, User.Role.ADMIN)
+        self.assertFalse(partial.is_staff)
+        self.assertFalse(partial.is_superuser)
+        self.assertFalse(partial.is_verified)
+        self.assertTrue(partial.is_active)
+        self.assertTrue(partial.check_password("UserPass123!"))
+
+    def test_inactive_admin_is_not_activated_silently(self):
+        inactive = User.objects.create_user(
+            username="sleepy@example.com",
+            email="sleepy@example.com",
+            password="UserPass123!",
+            role=User.Role.ADMIN,
+            is_staff=True,
+            is_superuser=True,
+            is_verified=True,
+            is_active=False,
+        )
+
+        with self.assertRaises(CommandError) as ctx:
+            call_command(
+                "ensure_superuser",
+                email="sleepy@example.com",
+                password=self.PASSWORD,
+            )
+        self.assertIn("Nothing was changed", str(ctx.exception))
+
+        inactive.refresh_from_db()
+        self.assertEqual(User.objects.count(), 1)
+        self.assertFalse(inactive.is_active)
+        self.assertTrue(inactive.check_password("UserPass123!"))
+
+    def test_password_is_never_printed(self):
+        out = StringIO()
+        call_command(
+            "ensure_superuser",
+            email="silent@example.com",
+            password=self.PASSWORD,
+            stdout=out,
+        )
+        self.assertNotIn(self.PASSWORD, out.getvalue())
+
+        rerun_out = StringIO()
+        call_command(
+            "ensure_superuser",
+            email="silent@example.com",
+            password=self.PASSWORD,
+            stdout=rerun_out,
+        )
+        self.assertNotIn(self.PASSWORD, rerun_out.getvalue())
+
+    def test_missing_password_for_new_account_fails(self):
+        with self.assertRaises(CommandError):
+            call_command("ensure_superuser", email="newpass@example.com", password="")
+        self.assertFalse(User.objects.filter(username="newpass@example.com").exists())
+
+    def test_weak_password_rejected_for_new_account(self):
+        with self.assertRaises(CommandError):
+            call_command("ensure_superuser", email="weakadmin@example.com", password="123")
+        self.assertFalse(User.objects.filter(username="weakadmin@example.com").exists())
+
+    def test_invalid_email_rejected(self):
+        with self.assertRaises(CommandError):
+            call_command("ensure_superuser", email="not-an-email", password=self.PASSWORD)
+        self.assertEqual(User.objects.count(), 0)
+
+
+class ProfileUpdateAPITests(TestCase):
+    """Dashboard profile editing: only safe fields are writable."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="profile@example.com",
+            email="profile@example.com",
+            password="Password123!",
+            first_name="Plain",
+            last_name="User",
+        )
+        self.other = User.objects.create_user(
+            username="other@example.com",
+            email="other@example.com",
+            password="Password123!",
+        )
+        self.admin = User.objects.create_superuser(
+            username="boss@example.com",
+            email="boss@example.com",
+            password="Password123!",
+        )
+        # create_superuser does not set the custom role/verified fields; mirror
+        # the permanent admin account's shape so privilege-preservation tests
+        # are realistic.
+        self.admin.role = User.Role.ADMIN
+        self.admin.is_verified = True
+        self.admin.save()
+
+    def test_get_profile(self):
+        self.client.force_authenticate(self.user)
+        res = self.client.get("/api/profile/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.json()["email"], "profile@example.com")
+        self.assertEqual(res.json()["first_name"], "Plain")
+
+    def test_user_can_update_own_name_and_email(self):
+        self.client.force_authenticate(self.user)
+        res = self.client.patch(
+            "/api/profile/",
+            data={"first_name": "Updated", "last_name": "Name", "email": "New.Email@Example.com"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.content)
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.first_name, "Updated")
+        self.assertEqual(self.user.last_name, "Name")
+        self.assertEqual(self.user.email, "new.email@example.com")
+        # Login treats username as the lowercased email, so they stay in sync.
+        self.assertEqual(self.user.username, "new.email@example.com")
+        self.assertEqual(res.json()["username"], "new.email@example.com")
+
+    def test_privileged_fields_cannot_be_escalated_via_patch(self):
+        self.client.force_authenticate(self.user)
+        res = self.client.patch(
+            "/api/profile/",
+            data={
+                "first_name": "Sneaky",
+                "is_staff": True,
+                "role": User.Role.ADMIN,
+                "is_verified": True,
+                "is_superuser": True,
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.content)
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.first_name, "Sneaky")  # permitted field applied
+        self.assertFalse(self.user.is_staff)
+        self.assertFalse(self.user.is_superuser)
+        self.assertEqual(self.user.role, User.Role.CLIENT)
+        self.assertFalse(self.user.is_verified)
+
+        body = res.json()
+        self.assertFalse(body["is_staff"])
+        self.assertEqual(body["role"], User.Role.CLIENT)
+        self.assertFalse(body["is_verified"])
+
+    def test_privileged_fields_cannot_be_escalated_via_put(self):
+        self.client.force_authenticate(self.user)
+        res = self.client.put(
+            "/api/profile/",
+            data={"first_name": "Sneaky", "is_staff": True, "role": "admin", "is_superuser": True},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.content)
+
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_staff)
+        self.assertFalse(self.user.is_superuser)
+        self.assertEqual(self.user.role, User.Role.CLIENT)
+
+    def test_username_cannot_be_changed(self):
+        self.client.force_authenticate(self.user)
+        res = self.client.patch(
+            "/api/profile/",
+            data={"username": "hijack@example.com"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.username, "profile@example.com")
+
+    def test_email_uniqueness_enforced(self):
+        self.client.force_authenticate(self.user)
+        res = self.client.patch(
+            "/api/profile/",
+            data={"email": "Other@Example.com"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", res.json())
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.email, "profile@example.com")
+
+    def test_admin_profile_update_preserves_privileges(self):
+        self.client.force_authenticate(self.admin)
+        res = self.client.patch(
+            "/api/profile/",
+            data={"first_name": "Chief", "email": "boss.new@example.com"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.content)
+
+        self.admin.refresh_from_db()
+        self.assertEqual(self.admin.first_name, "Chief")
+        self.assertEqual(self.admin.email, "boss.new@example.com")
+        self.assertEqual(self.admin.username, "boss.new@example.com")
+        self.assertTrue(self.admin.is_staff)
+        self.assertTrue(self.admin.is_superuser)
+        self.assertEqual(self.admin.role, User.Role.ADMIN)
+        self.assertTrue(self.admin.is_verified)
+
+    def test_profile_update_requires_authentication(self):
+        res = self.client.patch("/api/profile/", data={"first_name": "Anon"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)

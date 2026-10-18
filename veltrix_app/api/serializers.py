@@ -79,9 +79,48 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
+    """Serializer for reading and safely updating a user's own profile.
+
+    Privileged fields are strictly read-only: an ordinary (or staff) user can
+    never grant themselves ``is_staff``, ``is_superuser``, ``role``, or
+    ``is_verified`` through a profile request. ``username`` is read-only too
+    because login treats it as the canonical lowercased email; changing the
+    email through ``update()`` keeps username in sync so login keeps working.
+    """
+
     class Meta:
         model = User
         fields = ("id", "username", "email", "first_name", "last_name", "role", "is_verified", "is_staff")
+        read_only_fields = ("id", "username", "role", "is_verified", "is_staff")
+
+    def validate_email(self, value):
+        # Same normalization and uniqueness rule as registration so a profile
+        # update can never create a second account with a case-variant email.
+        email = normalize_email(value)
+        existing = User.objects.filter(models.Q(username__iexact=email) | models.Q(email__iexact=email))
+        if self.instance is not None:
+            existing = existing.exclude(pk=self.instance.pk)
+        if existing.exists():
+            raise serializers.ValidationError("A user with this email already exists.")
+        return email
+
+    def update(self, instance, validated_data):
+        # Only first_name, last_name and email are ever writable; everything
+        # else on the instance (staff flags, role, verified status, groups,
+        # permissions, unrelated fields) is left untouched.
+        update_fields = []
+        new_email = validated_data.get("email")
+        if new_email is not None and new_email != instance.email:
+            instance.email = new_email
+            instance.username = new_email
+            update_fields.extend(["email", "username"])
+        for field in ("first_name", "last_name"):
+            if field in validated_data:
+                setattr(instance, field, validated_data[field])
+                update_fields.append(field)
+        if update_fields:
+            instance.save(update_fields=update_fields)
+        return instance
 
 
 class TransactionSerializer(serializers.ModelSerializer):

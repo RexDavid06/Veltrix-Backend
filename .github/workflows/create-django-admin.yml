@@ -1,0 +1,126 @@
+name: Create Django Admin (one-time, rerun-safe)
+
+# Manually dispatched only. Creates the permanent superuser in the existing
+# production PostgreSQL database using repository secrets. Re-running is safe:
+# the ensure_superuser command never duplicates accounts, never resets a
+# password, and never silently promotes an existing account. An account that
+# exists but is not a complete active admin fails the job for manual review.
+
+on:
+  workflow_dispatch:
+
+# The job only reads the repo; it never writes to it.
+permissions:
+  contents: read
+
+# Never let two runs race each other into creating duplicate accounts.
+concurrency:
+  group: create-django-admin
+  cancel-in-progress: false
+
+jobs:
+  create-admin:
+    name: Create permanent superuser
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # One-shot management-command process; it never serves HTTP. Production
+      # settings (DEBUG=0) are exercised exactly as they run on Render, with
+      # the production SECRET_KEY supplied from repository secrets. All
+      # credentials come exclusively from repository secrets and are masked
+      # automatically in logs; no step prints a secret value.
+      DEBUG: "0"
+      SECRET_KEY: ${{ secrets.SECRET_KEY }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DJANGO_SUPERUSER_USERNAME: ${{ secrets.DJANGO_SUPERUSER_USERNAME }}
+      DJANGO_SUPERUSER_EMAIL: ${{ secrets.DJANGO_SUPERUSER_EMAIL }}
+      DJANGO_SUPERUSER_PASSWORD: ${{ secrets.DJANGO_SUPERUSER_PASSWORD }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify required secrets are configured (values never printed)
+        run: |
+          missing=0
+          for name in DATABASE_URL SECRET_KEY DJANGO_SUPERUSER_EMAIL DJANGO_SUPERUSER_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing required repository secret: ${name}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Set the missing secret(s) under Settings > Secrets and variables > Actions, then re-run this workflow."
+            exit 1
+          fi
+
+      - name: Verify DATABASE_URL points at PostgreSQL (nothing secret is printed)
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          # Only the URL scheme is inspected; the URL itself embeds credentials
+          # and is never printed.
+          url = os.environ.get("DATABASE_URL", "")
+          scheme = url.partition("://")[0].lower()
+          if scheme not in ("postgres", "postgresql"):
+              print("::error::DATABASE_URL must use the postgres:// or postgresql:// scheme.")
+              sys.exit(1)
+          print("DATABASE_URL scheme is PostgreSQL.")
+          PY
+
+      - name: Check database connectivity (read-only SELECT 1)
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          os.environ.setdefault("DJANGO_SETTINGS_MODULE", "veltrix_project.settings")
+          import django
+
+          django.setup()
+          from django.db import connection
+
+          try:
+              with connection.cursor() as cursor:
+                  cursor.execute("SELECT 1")
+                  cursor.fetchone()
+          except Exception:
+              # Exception details may contain hosts or usernames; print only a
+              # generic failure so no secret value reaches the logs.
+              print("::error::Database connectivity check failed (read-only SELECT 1).")
+              sys.exit(1)
+          # Vendor only (e.g. "postgresql") - never hosts, users, or credentials.
+          print(f"Database connectivity OK (vendor: {connection.vendor}).")
+          PY
+
+      - name: Verify migration state (this job never applies migrations)
+        # Reviewed and justified decision: DO NOT run `migrate` here.
+        # veltrix_app/0002_zero_existing_accounts.py is a DESTRUCTIVE data
+        # migration (zeroes every demo balance, deletes all positions and
+        # transactions). Production schema is owned by Render: the Dockerfile
+        # CMD runs `python manage.py migrate --noinput` on every deploy.
+        # `migrate --check` exits non-zero when unapplied migrations exist
+        # WITHOUT applying anything, so drift is surfaced clearly instead of
+        # being changed from CI.
+        run: |
+          if ! python manage.py migrate --check --noinput; then
+            echo "::error::Unapplied migrations detected. Deploy through Render (its start command runs migrations); do not apply them from CI."
+            exit 1
+          fi
+          echo "Migration state matches the repository."
+
+      - name: Create superuser (idempotent; never resets or promotes an existing account)
+        run: python manage.py ensure_superuser
