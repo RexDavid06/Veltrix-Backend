@@ -172,13 +172,14 @@ class MessageSerializer(serializers.ModelSerializer):
 
 
 class ConversationListSerializer(serializers.ModelSerializer):
+    user = UserProfileSerializer(read_only=True)
     unread_count = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
     messages = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
-        fields = ("id", "subject", "is_active", "assigned_to", "created_at", "updated_at", "unread_count", "last_message", "messages")
+        fields = ("id", "subject", "user", "is_active", "assigned_to", "created_at", "updated_at", "unread_count", "last_message", "messages")
 
     def get_unread_count(self, obj):
         # The list view annotates this to avoid one COUNT query per conversation.
@@ -215,12 +216,13 @@ class ConversationListSerializer(serializers.ModelSerializer):
 
 
 class ConversationDetailSerializer(serializers.ModelSerializer):
+    user = UserProfileSerializer(read_only=True)
     messages = MessageSerializer(many=True, read_only=True)
     assigned_to = UserProfileSerializer(read_only=True)
 
     class Meta:
         model = Conversation
-        fields = ("id", "subject", "is_active", "assigned_to", "created_at", "updated_at", "messages")
+        fields = ("id", "subject", "user", "is_active", "assigned_to", "created_at", "updated_at", "messages")
         read_only_fields = ("id", "created_at", "updated_at", "messages")
 
 

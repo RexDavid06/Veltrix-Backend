@@ -1,4 +1,4 @@
-from django.urls import path
+from django.urls import include, path
 from rest_framework_simplejwt.views import TokenBlacklistView, TokenRefreshView
 
 from .views import (
@@ -65,4 +65,7 @@ urlpatterns = [
     # password reset
     path("auth/password-reset/", PasswordResetRequestAPIView.as_view(), name="api_password_reset"),
     path("auth/password-reset/confirm/", PasswordResetConfirmAPIView.as_view(), name="api_password_reset_confirm"),
+
+    # Admin dashboard API (every endpoint is guarded by IsPlatformAdmin)
+    path("admin/", include("veltrix_app.api.admin_urls")),
 ]
