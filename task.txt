@@ -1,0 +1,27 @@
+Modify my Veltrix-Backend project so the existing GitHub Actions admin workflow can reset the existing production administrator account in place.
+
+Project details
+
+- Repository: "RexDavid06/Veltrix-Backend"
+- Existing workflow: ".github/workflows/create-django-admin.yml"
+- Existing command: "veltrix_app/management/commands/ensure_superuser.py"
+- Custom user model: "veltrix_app.User"
+- Desired username: "veltrixadmin"
+- Desired email: "veltrix@gmail.com"
+- Existing GitHub secrets: "SECRET_KEY", "DATABASE_URL", "DJANGO_SUPERUSER_USERNAME", "DJANGO_SUPERUSER_EMAIL", "DJANGO_SUPERUSER_PASSWORD"
+
+Requirements
+
+1. Reuse the existing workflow and its existing secret names. Do not ask me to provide any password in chat, terminal commands, or workflow inputs.
+2. Change the workflow and management command so the operation explicitly resets the existing administrator account rather than creating a duplicate.
+3. Identify the existing account safely. If there is not exactly one eligible existing superuser, stop with a clear, non-sensitive error. Never guess which account to change and never create an account as a fallback.
+4. Check for username or email conflicts with other accounts before making changes. If a conflict exists, abort without modifying anything.
+5. Validate the requested email and password using Django's validators before changing the account.
+6. Perform the update in a database transaction. Set the username and email from the configured environment variables, set the password using Django's "set_password()", and ensure "is_active=True", "is_staff=True", "is_superuser=True", "is_verified=True", and "role=admin".
+7. Require an explicit confirmation in the manually dispatched GitHub workflow before any database modification.
+8. Keep "SECRET_KEY" and "DATABASE_URL" secret. Never print credentials, password hashes, database URLs, or passwords in logs.
+9. Do not run migrations from this workflow. Keep the existing read-only database connectivity check and "migrate --check".
+10. Add or update automated tests covering successful reset, no existing superuser, multiple superusers, username/email conflicts, invalid email, weak password, rollback/no changes on failure, and ensuring no duplicate account is created.
+11. Do not connect to production, dispatch the workflow, modify GitHub secrets, or commit changes.
+
+Run the relevant tests and "git diff --check". Show me the final diff, test results, and a brief explanation of how the workflow will behave. Do not claim success unless the tests actually pass.
