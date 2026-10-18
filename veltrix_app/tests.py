@@ -60,7 +60,7 @@ class UserAuthAndRegistrationTests(TestCase):
         # Check DemoAccount
         account = DemoAccount.objects.get(user=user)
         self.assertEqual(account.currency, "USD")
-        self.assertEqual(account.cash_balance, Decimal("10000.00"))
+        self.assertEqual(account.cash_balance, Decimal("0.00"))
 
     def test_jwt_token_obtain(self):
         User.objects.create_user(

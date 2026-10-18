@@ -57,7 +57,7 @@ class RegisterAPIView(generics.CreateAPIView):
 
     def perform_create(self, serializer):
         user = serializer.save()
-        DemoAccount.objects.get_or_create(user=user, defaults={"currency": "USD", "cash_balance": "10000.00"})
+        DemoAccount.objects.get_or_create(user=user, defaults={"currency": "USD", "cash_balance": "0.00"})
 
 
 class ProfileAPIView(APIView):
