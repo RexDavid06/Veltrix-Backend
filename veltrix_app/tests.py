@@ -390,167 +390,244 @@ class ConversationMessageContractTests(TestCase):
 
 
 class EnsureSuperuserCommandTests(TestCase):
-    """The one-time admin creation command used by the GitHub Actions workflow."""
+    """The confirmed admin-reset command used by the create-django-admin workflow."""
 
     PASSWORD = "AdminPass123!"
+    USERNAME = "veltrixadmin"
+    EMAIL = "veltrix@gmail.com"
+    CONFIRM = "RESET_EXISTING_ADMIN"
 
-    def test_creates_admin_from_environment_variables(self):
+    def _env(self, **overrides):
         env = {
-            "DJANGO_SUPERUSER_EMAIL": "Root@Example.com",
+            "DJANGO_SUPERUSER_USERNAME": self.USERNAME,
+            "DJANGO_SUPERUSER_EMAIL": self.EMAIL,
             "DJANGO_SUPERUSER_PASSWORD": self.PASSWORD,
         }
-        with mock.patch.dict(os.environ, env):
-            call_command("ensure_superuser")
+        env.update(overrides)
+        return env
 
-        user = User.objects.get(email="root@example.com")
-        self.assertEqual(user.username, "root@example.com")
-        self.assertEqual(user.role, User.Role.ADMIN)
-        self.assertTrue(user.is_staff)
-        self.assertTrue(user.is_superuser)
-        self.assertTrue(user.is_verified)
-        self.assertTrue(user.is_active)
-        self.assertTrue(user.check_password(self.PASSWORD))
+    def _create_active_superuser(
+        self, username="oldadmin@example.com", password="OldPassword123!", **kwargs
+    ):
+        defaults = {
+            "email": username,
+            "password": password,
+            "role": User.Role.ADMIN,
+            "is_staff": True,
+            "is_superuser": True,
+            "is_verified": True,
+            "is_active": True,
+        }
+        defaults.update(kwargs)
+        return User.objects.create_user(username=username, **defaults)
+
+    def _call(self, confirm=CONFIRM, **kwargs):
+        call_command("ensure_superuser", confirm=confirm, **kwargs)
+
+    def test_incorrect_confirmation_is_rejected_before_any_change(self):
+        self._create_active_superuser()
+        with mock.patch.dict(os.environ, self._env()):
+            with self.assertRaises(CommandError) as ctx:
+                self._call(confirm="yes")
+        self.assertIn("RESET_EXISTING_ADMIN", str(ctx.exception))
+
+        user = User.objects.get(username="oldadmin@example.com")
+        self.assertTrue(user.check_password("OldPassword123!"))
         self.assertEqual(User.objects.count(), 1)
 
-    def test_username_defaults_to_lowercased_email(self):
-        call_command("ensure_superuser", email="Admin2@Example.com", password=self.PASSWORD)
+    def test_missing_confirmation_is_rejected(self):
+        self._create_active_superuser()
+        with mock.patch.dict(os.environ, self._env()):
+            with self.assertRaises(CommandError):
+                self._call(confirm="")
+        self.assertEqual(User.objects.get().username, "oldadmin@example.com")
+
+    def test_zero_existing_superusers_fails_without_creating_anything(self):
+        with mock.patch.dict(os.environ, self._env()):
+            with self.assertRaises(CommandError) as ctx:
+                self._call()
+        self.assertIn("exactly one active superuser", str(ctx.exception))
+        self.assertEqual(User.objects.count(), 0)
+
+    def test_multiple_superusers_fail_without_changes(self):
+        first = self._create_active_superuser(username="admin1@example.com")
+        second = self._create_active_superuser(username="admin2@example.com")
+        with mock.patch.dict(os.environ, self._env()):
+            with self.assertRaises(CommandError) as ctx:
+                self._call()
+        self.assertIn("exactly one active superuser", str(ctx.exception))
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(User.objects.count(), 2)
+        self.assertEqual(first.username, "admin1@example.com")
+        self.assertEqual(second.username, "admin2@example.com")
+        self.assertTrue(first.check_password("OldPassword123!"))
+        self.assertTrue(second.check_password("OldPassword123!"))
+
+    def test_inactive_superuser_is_not_reset(self):
+        self._create_active_superuser(is_active=False)
+        with mock.patch.dict(os.environ, self._env()):
+            with self.assertRaises(CommandError):
+                self._call()
         user = User.objects.get()
-        self.assertEqual(user.username, "admin2@example.com")
-        self.assertEqual(user.email, "admin2@example.com")
+        self.assertFalse(user.is_active)
+        self.assertEqual(user.username, "oldadmin@example.com")
+        self.assertTrue(user.check_password("OldPassword123!"))
 
-    def test_rerun_reports_exists_without_changing_anything(self):
-        call_command("ensure_superuser", email="keep@example.com", password=self.PASSWORD)
-        original = User.objects.get(username="keep@example.com")
-
-        out = StringIO()
-        call_command(
-            "ensure_superuser",
-            email="keep@example.com",
-            password="TotallyDifferent1!",
-            stdout=out,
+    def test_username_conflict_with_another_account_aborts(self):
+        target = self._create_active_superuser()
+        User.objects.create_user(
+            username=self.USERNAME,
+            email="collision@example.com",
+            password="OtherUserPass123!",
         )
+        with mock.patch.dict(os.environ, self._env()):
+            with self.assertRaises(CommandError) as ctx:
+                self._call()
+        self.assertIn("already held by another account", str(ctx.exception))
 
-        original.refresh_from_db()
-        self.assertEqual(User.objects.count(), 1)
-        # Password must NOT be reset and permissions must NOT change on rerun.
-        self.assertTrue(original.check_password(self.PASSWORD))
-        self.assertFalse(original.check_password("TotallyDifferent1!"))
-        self.assertEqual(original.role, User.Role.ADMIN)
-        self.assertTrue(original.is_staff)
-        self.assertTrue(original.is_superuser)
-        self.assertIn("already exists", out.getvalue())
+        target.refresh_from_db()
+        self.assertEqual(target.username, "oldadmin@example.com")
+        self.assertEqual(target.email, "oldadmin@example.com")
+        self.assertTrue(target.check_password("OldPassword123!"))
+        self.assertEqual(User.objects.count(), 2)
 
-    def test_existing_non_admin_account_is_not_modified(self):
-        victim = User.objects.create_user(
-            username="ordinary@example.com",
-            email="ordinary@example.com",
-            password="UserPass123!",
+    def test_email_conflict_with_another_account_aborts(self):
+        target = self._create_active_superuser()
+        User.objects.create_user(
+            username="someone-else@example.com",
+            email=self.EMAIL,
+            password="OtherUserPass123!",
         )
-        with self.assertRaises(CommandError) as ctx:
-            call_command(
-                "ensure_superuser",
-                email="ordinary@example.com",
-                password=self.PASSWORD,
-            )
+        with mock.patch.dict(os.environ, self._env()):
+            with self.assertRaises(CommandError) as ctx:
+                self._call()
+        self.assertIn("already held by another account", str(ctx.exception))
 
-        message = str(ctx.exception)
-        self.assertIn("already exists", message)
-        self.assertIn("Nothing was changed", message)
+        target.refresh_from_db()
+        self.assertEqual(target.username, "oldadmin@example.com")
+        self.assertTrue(target.check_password("OldPassword123!"))
 
-        victim.refresh_from_db()
-        self.assertEqual(User.objects.count(), 1)
-        self.assertEqual(victim.role, User.Role.CLIENT)
-        self.assertFalse(victim.is_staff)
-        self.assertFalse(victim.is_superuser)
-        self.assertFalse(victim.is_verified)
-        self.assertTrue(victim.is_active)
-        self.assertTrue(victim.check_password("UserPass123!"))
+    def test_missing_password_fails_before_write(self):
+        self._create_active_superuser()
+        with mock.patch.dict(os.environ, self._env()):
+            os.environ.pop("DJANGO_SUPERUSER_PASSWORD", None)
+            with self.assertRaises(CommandError) as ctx:
+                self._call()
+        self.assertIn("DJANGO_SUPERUSER_PASSWORD", str(ctx.exception))
 
-    def test_partial_admin_is_not_silently_promoted(self):
-        partial = User.objects.create_user(
-            username="partial@example.com",
-            email="partial@example.com",
-            password="UserPass123!",
-            role=User.Role.ADMIN,
+        user = User.objects.get()
+        self.assertEqual(user.username, "oldadmin@example.com")
+        self.assertTrue(user.check_password("OldPassword123!"))
+
+    def test_weak_password_fails_before_write(self):
+        self._create_active_superuser()
+        with mock.patch.dict(os.environ, self._env(DJANGO_SUPERUSER_PASSWORD="123")):
+            with self.assertRaises(CommandError) as ctx:
+                self._call()
+        self.assertIn("password validators", str(ctx.exception))
+
+        user = User.objects.get()
+        self.assertEqual(user.username, "oldadmin@example.com")
+        self.assertTrue(user.check_password("OldPassword123!"))
+
+    def test_invalid_email_rejected_before_write(self):
+        self._create_active_superuser()
+        with mock.patch.dict(os.environ, self._env(DJANGO_SUPERUSER_EMAIL="not-an-email")):
+            with self.assertRaises(CommandError) as ctx:
+                self._call()
+        self.assertIn("email validators", str(ctx.exception))
+
+        user = User.objects.get()
+        self.assertEqual(user.email, "oldadmin@example.com")
+        self.assertTrue(user.check_password("OldPassword123!"))
+
+    def test_successful_reset_updates_the_single_existing_account(self):
+        target = self._create_active_superuser(is_verified=False)
+        env = self._env(
+            DJANGO_SUPERUSER_USERNAME="  VeltrixAdmin  ",
+            DJANGO_SUPERUSER_EMAIL="Veltrix@Gmail.com",
         )
-        self.assertFalse(partial.is_staff)
-        self.assertFalse(partial.is_superuser)
+        with mock.patch.dict(os.environ, env):
+            out = StringIO()
+            self._call(stdout=out)
 
-        with self.assertRaises(CommandError) as ctx:
-            call_command(
-                "ensure_superuser",
-                email="partial@example.com",
-                password=self.PASSWORD,
-            )
-        self.assertIn("Nothing was changed", str(ctx.exception))
+        target.refresh_from_db()
+        self.assertEqual(target.username, self.USERNAME)
+        self.assertEqual(target.email, self.EMAIL)
+        self.assertTrue(target.check_password(self.PASSWORD))
+        self.assertTrue(target.is_active)
+        self.assertTrue(target.is_staff)
+        self.assertTrue(target.is_superuser)
+        self.assertEqual(target.role, User.Role.ADMIN)
+        self.assertTrue(target.is_verified)
+        self.assertIn(self.USERNAME, out.getvalue())
+        self.assertIn(self.EMAIL, out.getvalue())
 
-        partial.refresh_from_db()
+    def test_identity_values_are_read_from_environment_variables(self):
+        target = self._create_active_superuser()
+        with mock.patch.dict(os.environ, self._env()):
+            self._call()
+
+        target.refresh_from_db()
+        self.assertEqual(target.username, self.USERNAME)
+        self.assertEqual(target.email, self.EMAIL)
+
+    def test_reset_never_creates_a_duplicate_account(self):
+        self._create_active_superuser()
+        with mock.patch.dict(os.environ, self._env()):
+            self._call()
+            self._call()
+
         self.assertEqual(User.objects.count(), 1)
-        self.assertEqual(partial.role, User.Role.ADMIN)
-        self.assertFalse(partial.is_staff)
-        self.assertFalse(partial.is_superuser)
-        self.assertFalse(partial.is_verified)
-        self.assertTrue(partial.is_active)
-        self.assertTrue(partial.check_password("UserPass123!"))
+        user = User.objects.get()
+        self.assertEqual(user.username, self.USERNAME)
+        self.assertEqual(user.email, self.EMAIL)
+        self.assertTrue(user.check_password(self.PASSWORD))
 
-    def test_inactive_admin_is_not_activated_silently(self):
-        inactive = User.objects.create_user(
-            username="sleepy@example.com",
-            email="sleepy@example.com",
-            password="UserPass123!",
-            role=User.Role.ADMIN,
-            is_staff=True,
-            is_superuser=True,
-            is_verified=True,
-            is_active=False,
+    def test_other_accounts_are_never_modified(self):
+        target = self._create_active_superuser()
+        bystander = User.objects.create_user(
+            username="bystander@example.com",
+            email="bystander@example.com",
+            password="BystanderPass123!",
         )
+        with mock.patch.dict(os.environ, self._env()):
+            self._call()
 
-        with self.assertRaises(CommandError) as ctx:
-            call_command(
-                "ensure_superuser",
-                email="sleepy@example.com",
-                password=self.PASSWORD,
-            )
-        self.assertIn("Nothing was changed", str(ctx.exception))
+        target.refresh_from_db()
+        bystander.refresh_from_db()
+        self.assertEqual(target.username, self.USERNAME)
+        self.assertEqual(bystander.username, "bystander@example.com")
+        self.assertEqual(bystander.role, User.Role.CLIENT)
+        self.assertFalse(bystander.is_staff)
+        self.assertFalse(bystander.is_superuser)
+        self.assertTrue(bystander.check_password("BystanderPass123!"))
+        self.assertEqual(User.objects.count(), 2)
 
-        inactive.refresh_from_db()
+    def test_failure_during_save_rolls_back_all_changes(self):
+        target = self._create_active_superuser(is_verified=False)
+        with mock.patch.dict(os.environ, self._env()):
+            with mock.patch.object(User, "save", side_effect=RuntimeError("simulated failure")):
+                with self.assertRaises(RuntimeError):
+                    self._call()
+
+        target.refresh_from_db()
         self.assertEqual(User.objects.count(), 1)
-        self.assertFalse(inactive.is_active)
-        self.assertTrue(inactive.check_password("UserPass123!"))
+        self.assertEqual(target.username, "oldadmin@example.com")
+        self.assertEqual(target.email, "oldadmin@example.com")
+        self.assertTrue(target.check_password("OldPassword123!"))
+        self.assertEqual(target.role, User.Role.ADMIN)
+        # The in-transaction promotion to is_verified=True was rolled back too.
+        self.assertFalse(target.is_verified)
 
     def test_password_is_never_printed(self):
-        out = StringIO()
-        call_command(
-            "ensure_superuser",
-            email="silent@example.com",
-            password=self.PASSWORD,
-            stdout=out,
-        )
+        self._create_active_superuser()
+        with mock.patch.dict(os.environ, self._env()):
+            out = StringIO()
+            self._call(stdout=out)
         self.assertNotIn(self.PASSWORD, out.getvalue())
-
-        rerun_out = StringIO()
-        call_command(
-            "ensure_superuser",
-            email="silent@example.com",
-            password=self.PASSWORD,
-            stdout=rerun_out,
-        )
-        self.assertNotIn(self.PASSWORD, rerun_out.getvalue())
-
-    def test_missing_password_for_new_account_fails(self):
-        with self.assertRaises(CommandError):
-            call_command("ensure_superuser", email="newpass@example.com", password="")
-        self.assertFalse(User.objects.filter(username="newpass@example.com").exists())
-
-    def test_weak_password_rejected_for_new_account(self):
-        with self.assertRaises(CommandError):
-            call_command("ensure_superuser", email="weakadmin@example.com", password="123")
-        self.assertFalse(User.objects.filter(username="weakadmin@example.com").exists())
-
-    def test_invalid_email_rejected(self):
-        with self.assertRaises(CommandError):
-            call_command("ensure_superuser", email="not-an-email", password=self.PASSWORD)
-        self.assertEqual(User.objects.count(), 0)
 
 
 class RecoverSuperuserCommandTests(TestCase):

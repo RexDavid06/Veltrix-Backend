@@ -1,26 +1,37 @@
-name: Create Django Admin (one-time, rerun-safe)
+name: Reset Django Admin (manual, confirmed)
 
-# Manually dispatched only. Creates the permanent superuser in the existing
-# production PostgreSQL database using repository secrets. Re-running is safe:
-# the ensure_superuser command never duplicates accounts, never resets a
-# password, and never silently promotes an existing account. An account that
-# exists but is not a complete active admin fails the job for manual review.
+# Manually dispatched only. Resets the ONE existing active production
+# administrator account IN PLACE in the existing PostgreSQL database,
+# using repository secrets for every credential. The ensure_superuser
+# command never creates an account (not even as a fallback), never
+# guesses which account to change, and never touches any other account:
+# unless exactly one active superuser exists it fails the job with a
+# generic, non-sensitive error for manual review. An incorrect
+# confirmation phrase is rejected before the runner even checks out the
+# repository, and the password is only ever read from the
+# DJANGO_SUPERUSER_PASSWORD secret - it is never a workflow input and is
+# never printed.
 
 on:
   workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RESET_EXISTING_ADMIN to authorize the reset. Any other value aborts before any database access."
+        required: true
+        type: string
 
 # The job only reads the repo; it never writes to it.
 permissions:
   contents: read
 
-# Never let two runs race each other into creating duplicate accounts.
+# Never let two runs race each other into conflicting admin resets.
 concurrency:
-  group: create-django-admin
+  group: reset-django-admin
   cancel-in-progress: false
 
 jobs:
-  create-admin:
-    name: Create permanent superuser
+  reset-admin:
+    name: Reset permanent superuser
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -37,6 +48,20 @@ jobs:
       DJANGO_SUPERUSER_PASSWORD: ${{ secrets.DJANGO_SUPERUSER_PASSWORD }}
 
     steps:
+      # Reject an incorrect confirmation before anything else happens -
+      # no checkout, no dependency install, and above all no database
+      # contact. The value is passed via env (not string interpolation) so
+      # a crafted input can never be executed by the shell.
+      - name: Reject incorrect confirmation before any database access
+        env:
+          CONFIRMATION_INPUT: ${{ inputs.confirmation }}
+        run: |
+          if [ "$CONFIRMATION_INPUT" != "RESET_EXISTING_ADMIN" ]; then
+            echo "::error::Confirmation phrase did not match. Nothing was contacted or changed."
+            exit 1
+          fi
+          echo "Confirmation phrase accepted."
+
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -54,7 +79,7 @@ jobs:
       - name: Verify required secrets are configured (values never printed)
         run: |
           missing=0
-          for name in DATABASE_URL SECRET_KEY DJANGO_SUPERUSER_EMAIL DJANGO_SUPERUSER_PASSWORD; do
+          for name in DATABASE_URL SECRET_KEY DJANGO_SUPERUSER_USERNAME DJANGO_SUPERUSER_EMAIL DJANGO_SUPERUSER_PASSWORD; do
             if [ -z "${!name}" ]; then
               echo "::error::Missing required repository secret: ${name}"
               missing=1
@@ -122,5 +147,7 @@ jobs:
           fi
           echo "Migration state matches the repository."
 
-      - name: Create superuser (idempotent; never resets or promotes an existing account)
-        run: python manage.py ensure_superuser
+      - name: Reset superuser (updates exactly one existing active admin)
+        env:
+          CONFIRMATION_INPUT: ${{ inputs.confirmation }}
+        run: python manage.py ensure_superuser --confirm "$CONFIRMATION_INPUT"
