@@ -67,21 +67,45 @@ class ProfileAPIView(APIView):
     UserProfileSerializer's read-only fields and update()). Privileged fields
     such as is_staff, role and is_verified can never be changed here, and the
     endpoint only ever operates on request.user.
+
+    The user is always derived from the authenticated request — never from a
+    client-supplied id — so there is no path to read or modify another
+    account through this endpoint. Inactive accounts are rejected explicitly
+    (in addition to JWT authentication refusing them) and no password,
+    token or other credential material is ever serialized.
     """
 
     permission_classes = (permissions.IsAuthenticated,)
 
+    @staticmethod
+    def _require_active(user):
+        if not user.is_active:
+            return Response(
+                {"detail": "This account is inactive."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return None
+
     def get(self, request):
+        denied = self._require_active(request.user)
+        if denied:
+            return denied
         serializer = UserProfileSerializer(request.user)
         return Response(serializer.data)
 
     def patch(self, request):
+        denied = self._require_active(request.user)
+        if denied:
+            return denied
         serializer = UserProfileSerializer(request.user, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(UserProfileSerializer(request.user).data)
 
     def put(self, request):
+        denied = self._require_active(request.user)
+        if denied:
+            return denied
         serializer = UserProfileSerializer(request.user, data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
