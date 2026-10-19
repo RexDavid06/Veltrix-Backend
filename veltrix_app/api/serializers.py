@@ -64,18 +64,54 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
 
 
 class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
-    """JWT login that treats the username as a case-insensitive email.
+    """JWT login that accepts either a username or an email.
 
-    Accounts are created with ``username = email.lower()``, but Django's
-    username lookup is case-sensitive. Normalizing here means a user can sign
-    in regardless of the casing/whitespace they type.
+    Client registration stores ``username = email.lower()``, but an
+    administrator provisioned by the ``ensure_superuser`` workflow has a
+    username that is *not* the email (for example ``username='veltrixadmin'``,
+    ``email='veltrix@gmail.com'``). Django Admin signs that account in by
+    username, so the API must not be stricter: the submitted identifier is
+    resolved against the username *or* the email, case-insensitively, and only
+    then handed to SimpleJWT authentication — which still verifies the
+    password and the account's active state. Unknown identifiers are left
+    untouched so they fail with the same generic error (no enumeration).
     """
 
     def validate(self, attrs):
-        username = attrs.get(self.username_field)
-        if isinstance(username, str):
-            attrs[self.username_field] = normalize_email(username)
-        return super().validate(attrs)
+        identifier = attrs.get(self.username_field)
+        if isinstance(identifier, str):
+            identifier = normalize_email(identifier)
+            attrs[self.username_field] = self._resolve_username(identifier) or identifier
+
+        data = super().validate(attrs)
+        # Return the authenticated identity/role, reusing the project's own
+        # profile projection (never the password hash or other internals).
+        data["user"] = UserProfileSerializer(self.user).data
+        return data
+
+    @staticmethod
+    def _resolve_username(identifier):
+        """Return the stored username matching a username or email login.
+
+        Exact usernames win, then case-insensitive usernames, then
+        case-insensitive emails. Active accounts are preferred when a legacy
+        duplicate exists. ``None`` means "no match": the caller keeps the
+        normalized identifier and lets authentication fail normally.
+        """
+        for lookup in (
+            models.Q(username=identifier),
+            models.Q(username__iexact=identifier),
+            models.Q(email__iexact=identifier),
+        ):
+            match = (
+                User.objects.filter(lookup)
+                .order_by("-is_active", "id")
+                .values_list("username", flat=True)
+                .first()
+            )
+            if match is not None:
+                return match
+        return None
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
