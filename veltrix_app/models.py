@@ -169,12 +169,19 @@ class Conversation(models.Model):
         return not self.is_active
 
     def unread_count_for(self, user):
+        # Number of messages in this conversation the given user has not yet
+        # read. Staff/admin see every message authored by someone else; the
+        # owning client only counts staff replies. Requests from anyone who is
+        # neither staff nor the conversation owner always return 0 so this
+        # helper can never leak a count across accounts.
         if not user or not user.is_authenticated:
             return 0
-        qs = self.messages.exclude(sender=user).filter(is_read=False)
-        if user.is_staff or user.is_admin():
-            return qs.count()
-        return qs.filter(sender__is_staff=False).count() if user == self.user else 0
+        is_staff = bool(getattr(user, "is_staff", False) or (hasattr(user, "is_admin") and user.is_admin()))
+        if is_staff:
+            return self.messages.exclude(sender=user).filter(is_read=False).count()
+        if user.id != self.user_id:
+            return 0
+        return self.messages.filter(is_read=False).exclude(sender=user).filter(sender__is_staff=True).count()
 
 
 class Message(models.Model):

@@ -200,11 +200,14 @@ class WatchlistItemSerializer(serializers.ModelSerializer):
 # --- Chat serializers ---
 class MessageSerializer(serializers.ModelSerializer):
     sender = UserProfileSerializer(read_only=True)
+    # Flat sender id so clients/admin can attribute a message to a user
+    # without parsing the nested object or trusting a content prefix.
+    sender_id = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = Message
-        fields = ("id", "conversation", "sender", "content", "is_read", "created_at")
-        read_only_fields = ("id", "sender", "is_read", "created_at")
+        fields = ("id", "conversation", "sender", "sender_id", "content", "is_read", "created_at")
+        read_only_fields = ("id", "sender", "sender_id", "is_read", "created_at")
 
 
 class ConversationListSerializer(serializers.ModelSerializer):
@@ -255,11 +258,15 @@ class ConversationDetailSerializer(serializers.ModelSerializer):
     user = UserProfileSerializer(read_only=True)
     messages = MessageSerializer(many=True, read_only=True)
     assigned_to = UserProfileSerializer(read_only=True)
+    unread_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
-        fields = ("id", "subject", "user", "is_active", "assigned_to", "created_at", "updated_at", "messages")
-        read_only_fields = ("id", "created_at", "updated_at", "messages")
+        fields = ("id", "subject", "user", "is_active", "assigned_to", "created_at", "updated_at", "messages", "unread_count")
+        read_only_fields = ("id", "created_at", "updated_at", "messages", "unread_count")
+
+    def get_unread_count(self, obj):
+        return obj.unread_count_for(self.context.get("request").user)
 
 
 class CreateConversationSerializer(serializers.Serializer):

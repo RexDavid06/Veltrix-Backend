@@ -176,6 +176,26 @@ DEFAULT_MARKET_SYMBOLS = [
     "XAUUSD=X",
 ]
 
+# Demo (simulated) funding switch. This is the unbacked paper-trading top-up that
+# mints fake USD into DemoAccount.cash_balance. It is DISABLED BY DEFAULT IN
+# EVERY ENVIRONMENT: the only way to enable it is to set
+# FUNDING_DEMO_TOPUP_ENABLED=1 explicitly (local development or tests). There is
+# no implicit default or DEBUG-based fallback, so a production/deployment
+# misconfiguration cannot silently re-enable it.
+FUNDING_DEMO_TOPUP_ENABLED = os.environ.get("FUNDING_DEMO_TOPUP_ENABLED", "0") == "1"
+
+# Production safety valve. Veltrix is a production financial application, so
+# simulated funding must never be able to reach real customers. A deployment is
+# treated as production when DEBUG is off OR when a real database is configured
+# via DATABASE_URL (the Render / docker-compose production setup). In that case
+# the flag is forced back off at load time regardless of the environment variable,
+# so an accidental FUNDING_DEMO_TOPUP_ENABLED=1 in production can never mint
+# artificial balances. Demo-mode tests opt in explicitly via override_settings,
+# which bypasses this load-time guard.
+_funding_is_production_deployment = (not DEBUG) or bool(os.environ.get("DATABASE_URL"))
+if FUNDING_DEMO_TOPUP_ENABLED and _funding_is_production_deployment:
+    FUNDING_DEMO_TOPUP_ENABLED = False
+
 # CORS - the deployed SPA and both local dev servers must always be allowed.
 # Known app origins are MERGED with (not replaced by) CORS_ALLOWED_ORIGINS, so a
 # stale or restrictive environment value can never break login/registration in

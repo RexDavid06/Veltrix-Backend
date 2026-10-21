@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Count, Prefetch, Q
 from django.shortcuts import get_object_or_404
@@ -492,6 +493,15 @@ class TopUpAPIView(APIView):
     MAX_DEMO_TOPUP = Decimal("1000000.00")
 
     def post(self, request):
+        # Demo funding is disabled unless explicitly enabled. This check runs
+        # before any parsing, balance mutation or transaction creation so a
+        # disabled deployment can never mint simulated funds.
+        if not getattr(settings, "FUNDING_DEMO_TOPUP_ENABLED", False):
+            return Response(
+                {"detail": "Demo funding is disabled."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         try:
             amount = Decimal(str(request.data.get("amount")))
         except (InvalidOperation, TypeError, ValueError):

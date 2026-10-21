@@ -1,13 +1,16 @@
 import os
+import subprocess
+import sys
 from decimal import Decimal
 from io import StringIO
 from unittest import mock
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from rest_framework import status
@@ -318,6 +321,7 @@ class WatchlistAPITests(TestCase):
         self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+@override_settings(FUNDING_DEMO_TOPUP_ENABLED=True)
 class DemoTradingAPITests(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -362,6 +366,120 @@ class DemoTradingAPITests(TestCase):
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class DemoTopUpFundingToggleTests(TestCase):
+    """FUNDING_DEMO_TOPUP_ENABLED gates the simulated top-up endpoint.
+
+    The setting defaults to False in every environment, so the endpoint must
+    refuse to mint demo funds unless it is explicitly enabled (development or
+    tests). These tests pin the default, the disabled behaviour (403 + no
+    mutation) and the enabled behaviour.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="toggle@example.com",
+            email="toggle@example.com",
+            password="Password123!",
+        )
+        DemoAccount.objects.create(user=self.user, currency="USD", cash_balance=Decimal("100.00"))
+        self.url = "/api/portfolio/topup/"
+
+    def test_setting_defaults_to_false(self):
+        self.assertFalse(settings.FUNDING_DEMO_TOPUP_ENABLED)
+
+    def test_default_disabled_returns_403_without_mutation(self):
+        # No override: the real default (False) must block the endpoint.
+        self.client.force_authenticate(user=self.user)
+        res = self.client.post(self.url, data={"amount": "500.00"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.user.demo_account.refresh_from_db()
+        self.assertEqual(self.user.demo_account.cash_balance, Decimal("100.00"))
+        self.assertEqual(Transaction.objects.filter(user=self.user).count(), 0)
+
+    @override_settings(FUNDING_DEMO_TOPUP_ENABLED=False)
+    def test_explicitly_disabled_returns_403_without_mutation(self):
+        self.client.force_authenticate(user=self.user)
+        res = self.client.post(self.url, data={"amount": "500.00"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.user.demo_account.refresh_from_db()
+        self.assertEqual(self.user.demo_account.cash_balance, Decimal("100.00"))
+        self.assertEqual(Transaction.objects.filter(user=self.user).count(), 0)
+
+    @override_settings(FUNDING_DEMO_TOPUP_ENABLED=True)
+    def test_enabled_credits_demo_cash(self):
+        self.client.force_authenticate(user=self.user)
+        res = self.client.post(self.url, data={"amount": "500.00"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(res.json()["demo"])
+        self.user.demo_account.refresh_from_db()
+        self.assertEqual(self.user.demo_account.cash_balance, Decimal("600.00"))
+        self.assertEqual(Transaction.objects.filter(user=self.user, side="topup").count(), 1)
+
+    @override_settings(FUNDING_DEMO_TOPUP_ENABLED=True)
+    def test_unauthenticated_is_still_protected(self):
+        # Even with demo funding enabled, the endpoint stays behind auth.
+        res = self.client.post(self.url, data={"amount": "500.00"}, format="json")
+        self.assertIn(res.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+        self.assertEqual(Transaction.objects.filter(user=self.user).count(), 0)
+        self.user.demo_account.refresh_from_db()
+        self.assertEqual(self.user.demo_account.cash_balance, Decimal("100.00"))
+
+
+class DemoFundingProductionGuardTests(TestCase):
+    """A production deployment must never be able to enable simulated funding.
+
+    The safety valve runs at settings load time, so these tests load a fresh
+    copy of the settings module in a subprocess with a controlled environment.
+    """
+
+    def _load_funding_setting(self, env_overrides):
+        # Import the settings module directly rather than calling django.setup():
+        # setup() would try to load the database backend, which is unnecessary
+        # here and unavailable in some environments (e.g. no psycopg2).
+        code = (
+            "import veltrix_project.settings as s;"
+            "print(s.FUNDING_DEMO_TOPUP_ENABLED)"
+        )
+        env = dict(os.environ)
+        # Deterministic baseline for the scenario under test.
+        env.pop("FUNDING_DEMO_TOPUP_ENABLED", None)
+        env.pop("DATABASE_URL", None)
+        env["DJANGO_SETTINGS_MODULE"] = "veltrix_project.settings"
+        env["DEBUG"] = "1"
+        env["SECRET_KEY"] = "test-only-secret"
+        env.update(env_overrides)
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(settings.BASE_DIR),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    def test_production_debug_off_forces_funding_off(self):
+        self.assertEqual(
+            self._load_funding_setting({"DEBUG": "0", "FUNDING_DEMO_TOPUP_ENABLED": "1"}),
+            "False",
+        )
+
+    def test_production_with_database_url_forces_funding_off_even_if_debug_defaults(self):
+        self.assertEqual(
+            self._load_funding_setting(
+                {"DATABASE_URL": "postgres://user:pass@localhost/veltrix", "FUNDING_DEMO_TOPUP_ENABLED": "1"}
+            ),
+            "False",
+        )
+
+    def test_local_dev_can_explicitly_enable_funding(self):
+        self.assertEqual(
+            self._load_funding_setting({"DEBUG": "1", "FUNDING_DEMO_TOPUP_ENABLED": "1"}),
+            "True",
+        )
+
+
 class ConversationMessageContractTests(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -387,6 +505,205 @@ class ConversationMessageContractTests(TestCase):
         # sender is a nested object so the UI can distinguish self vs staff
         self.assertIn("is_staff", convo["messages"][0]["sender"])
         self.assertEqual(convo["messages"][0]["sender"]["id"], self.user.id)
+        # A flat sender_id is provided so the UI can attribute a message
+        # without parsing the nested object or trusting content prefixes.
+        self.assertEqual(convo["messages"][0]["sender_id"], self.user.id)
+
+
+class AdminMessagingFlowTests(TestCase):
+    """End-to-end contract for admin <-> client support messaging.
+
+    These tests pin the behaviour that had no regression coverage: a client
+    message produces a durable admin-visible unread notification, an
+    authorized admin can reply to the correct conversation, the reply is
+    attributed to the admin and is visible to the owning client only, and no
+    other client can read or write the conversation.
+    """
+
+    def setUp(self):
+        self.client_user = User.objects.create_user(
+            username="owner@example.com",
+            email="owner@example.com",
+            password="Password123!",
+            role=User.Role.CLIENT,
+        )
+        self.other_client = User.objects.create_user(
+            username="intruder@example.com",
+            email="intruder@example.com",
+            password="Password123!",
+            role=User.Role.CLIENT,
+        )
+        self.admin = User.objects.create_user(
+            username="staff@example.com",
+            email="staff@example.com",
+            password="Password123!",
+            role=User.Role.ADMIN,
+            is_staff=True,
+        )
+        self.conv = Conversation.objects.create(user=self.client_user, subject="Deposit query")
+
+    # ---- Issue 1: admin notification on a new client message ----
+
+    def test_client_message_is_persisted_and_notifies_admin(self):
+        api = APIClient()
+        api.force_authenticate(user=self.client_user)
+        res = api.post(
+            f"/api/conversations/{self.conv.id}/messages/",
+            data={"content": "Please help me understand my balance."},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+        # Persisted exactly once.
+        self.assertEqual(Message.objects.filter(conversation=self.conv).count(), 1)
+
+        # The admin is notified through the existing unread counter, which is
+        # what the admin support inbox reads on each poll.
+        admin_api = APIClient()
+        admin_api.force_authenticate(user=self.admin)
+        listing = admin_api.get("/api/conversations/").json()
+        convo = next(c for c in listing if c["id"] == self.conv.id)
+        self.assertEqual(convo["unread_count"], 1)
+
+    def test_admin_unread_count_does_not_double_count_on_refetch(self):
+        Message.objects.create(conversation=self.conv, sender=self.client_user, content="ping")
+        admin_api = APIClient()
+        admin_api.force_authenticate(user=self.admin)
+        # Repeated polls (the frontend does this) must be stable, not additive.
+        for _ in range(3):
+            listing = admin_api.get("/api/conversations/").json()
+            self.assertEqual(listing[0]["unread_count"], 1)
+
+    def test_mark_read_is_idempotent_for_admin(self):
+        Message.objects.create(conversation=self.conv, sender=self.client_user, content="ping")
+        admin_api = APIClient()
+        admin_api.force_authenticate(user=self.admin)
+        first = admin_api.post(f"/api/conversations/{self.conv.id}/mark-read/").json()
+        second = admin_api.post(f"/api/conversations/{self.conv.id}/mark-read/").json()
+        self.assertEqual(first, {"marked": 1})
+        self.assertEqual(second, {"marked": 0})
+        listing = admin_api.get("/api/conversations/").json()
+        self.assertEqual(listing[0]["unread_count"], 0)
+
+    # ---- Issue 2: admin replies reach the correct client ----
+
+    def test_admin_reply_is_persisted_and_visible_to_owner(self):
+        Message.objects.create(conversation=self.conv, sender=self.client_user, content="Hello")
+
+        admin_api = APIClient()
+        admin_api.force_authenticate(user=self.admin)
+        res = admin_api.post(
+            f"/api/conversations/{self.conv.id}/messages/",
+            data={"content": "[STAFF RESPONSE] Your balance is a simulated demo balance."},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        body = res.json()
+        # Server identifies the admin as the sender (both nested + flat id).
+        self.assertEqual(body["sender"]["id"], self.admin.id)
+        self.assertEqual(body["sender_id"], self.admin.id)
+        self.assertTrue(body["sender"]["is_staff"])
+        self.assertFalse(body["is_read"])
+
+        # The reply is persisted with the admin as sender.
+        reply = Message.objects.get(id=body["id"])
+        self.assertEqual(reply.sender_id, self.admin.id)
+        self.assertEqual(reply.conversation_id, self.conv.id)
+
+        # The owning client can fetch and see it in the correct conversation.
+        client_api = APIClient()
+        client_api.force_authenticate(user=self.client_user)
+        messages = client_api.get(f"/api/conversations/{self.conv.id}/messages/").json()["results"]
+        self.assertTrue(any(m["id"] == body["id"] for m in messages))
+
+        # The client is notified of the staff reply via the unread counter.
+        listing = client_api.get("/api/conversations/").json()
+        self.assertEqual(listing[0]["unread_count"], 1)
+
+    def test_other_clients_cannot_read_or_write_the_conversation(self):
+        Message.objects.create(conversation=self.conv, sender=self.client_user, content="private")
+
+        intruder_api = APIClient()
+        intruder_api.force_authenticate(user=self.other_client)
+        self.assertEqual(
+            intruder_api.get(f"/api/conversations/{self.conv.id}/messages/").status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        self.assertEqual(
+            intruder_api.get(f"/api/conversations/{self.conv.id}/").status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        self.assertEqual(
+            intruder_api.post(
+                f"/api/conversations/{self.conv.id}/messages/",
+                data={"content": "hijack"},
+                format="json",
+            ).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        # No message was written by the intruder.
+        self.assertFalse(Message.objects.filter(sender=self.other_client).exists())
+
+        # The other client's own list never exposes the conversation.
+        own = intruder_api.get("/api/conversations/").json()
+        self.assertFalse(any(c["id"] == self.conv.id for c in own))
+
+    def test_admin_reply_to_closed_conversation_is_rejected(self):
+        self.conv.is_active = False
+        self.conv.save(update_fields=["is_active"])
+        admin_api = APIClient()
+        admin_api.force_authenticate(user=self.admin)
+        res = admin_api.post(
+            f"/api/conversations/{self.conv.id}/messages/",
+            data={"content": "too late"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Message.objects.filter(conversation=self.conv).count(), 0)
+
+    def test_blank_admin_reply_is_rejected_without_persisting(self):
+        admin_api = APIClient()
+        admin_api.force_authenticate(user=self.admin)
+        res = admin_api.post(
+            f"/api/conversations/{self.conv.id}/messages/",
+            data={"content": "   "},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Message.objects.filter(conversation=self.conv).count(), 0)
+
+    def test_ordinary_client_cannot_reply_as_staff(self):
+        # A client posting to their own conversation is allowed, but the server
+        # always records *that client* as sender — never a staff identity — so
+        # a client can never forge an admin reply.
+        client_api = APIClient()
+        client_api.force_authenticate(user=self.client_user)
+        res = client_api.post(
+            f"/api/conversations/{self.conv.id}/messages/",
+            data={"content": "[STAFF RESPONSE] fake"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.json()["sender"]["id"], self.client_user.id)
+        self.assertFalse(res.json()["sender"]["is_staff"])
+
+    def test_client_message_updates_conversation_and_not_other_conversations(self):
+        other_conv = Conversation.objects.create(user=self.client_user, subject="Second")
+        admin_api = APIClient()
+        admin_api.force_authenticate(user=self.admin)
+
+        client_api = APIClient()
+        client_api.force_authenticate(user=self.client_user)
+        client_api.post(
+            f"/api/conversations/{self.conv.id}/messages/",
+            data={"content": "only this thread"},
+            format="json",
+        )
+
+        listing = admin_api.get("/api/conversations/").json()
+        by_id = {c["id"]: c for c in listing}
+        self.assertEqual(by_id[self.conv.id]["unread_count"], 1)
+        self.assertEqual(by_id[other_conv.id]["unread_count"], 0)
 
 
 class EnsureSuperuserCommandTests(TestCase):
