@@ -196,6 +196,19 @@ _funding_is_production_deployment = (not DEBUG) or bool(os.environ.get("DATABASE
 if FUNDING_DEMO_TOPUP_ENABLED and _funding_is_production_deployment:
     FUNDING_DEMO_TOPUP_ENABLED = False
 
+# Real deposits remain disabled until an operator completes provider, wallet,
+# network, webhook and settlement verification. Never infer enablement from DEBUG.
+FUNDING_DEPOSITS_ENABLED = os.environ.get("FUNDING_DEPOSITS_ENABLED", "0") == "1"
+NOWPAYMENTS_ENABLED = os.environ.get("NOWPAYMENTS_ENABLED", "0") == "1"
+FUNDING_REQUIRE_KYC = os.environ.get("FUNDING_REQUIRE_KYC", "1") == "1"
+# Live production funding requires a separate operator attestation after wallet,
+# callback, provider account and settlement have been verified. Sandbox remains
+# available in non-production environments without this production switch.
+FUNDING_LIVE_VERIFIED = os.environ.get("FUNDING_LIVE_VERIFIED", "0") == "1"
+if not DEBUG and not FUNDING_LIVE_VERIFIED:
+    FUNDING_DEPOSITS_ENABLED = False
+    NOWPAYMENTS_ENABLED = False
+
 # CORS - the deployed SPA and both local dev servers must always be allowed.
 # Known app origins are MERGED with (not replaced by) CORS_ALLOWED_ORIGINS, so a
 # stale or restrictive environment value can never break login/registration in
@@ -236,6 +249,8 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "anon": "20/min",
         "user": "1000/day",
+        "deposit_create": "5/hour",
+        "provider_webhook": "120/min",
     },
 }
 
