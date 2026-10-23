@@ -126,6 +126,8 @@ jobs:
               print("::error::A supported explicit PostgreSQL SSL mode is required.")
               sys.exit(1)
 
+          effective_port = 5432 if port is None else port
+
           if (
               parsed.scheme not in {"postgres", "postgresql"}
               or not actual_host
@@ -134,8 +136,7 @@ jobs:
               or not password
               or not decoded_username
               or not decoded_password
-              or port is None
-              or not 1 <= port <= 65535
+              or not 1 <= effective_port <= 65535
               or parsed.fragment
               or not valid_database_component
               or actual_host != expected_host
