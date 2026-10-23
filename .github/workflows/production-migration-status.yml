@@ -50,12 +50,46 @@ jobs:
           expected_host_raw = os.environ.get("EXPECTED_DATABASE_HOST", "")
           expected_name = os.environ.get("EXPECTED_DATABASE_NAME", "")
 
+          def normalize_hostname(value):
+              return value.strip().lower().rstrip(".")
+
+          def is_hostname_alone(value):
+              candidate = value.strip()
+              if not candidate:
+                  return False
+              try:
+                  parsed_host = urlsplit("//" + candidate)
+                  parsed_port = parsed_host.port
+              except ValueError:
+                  return False
+
+              normalized = normalize_hostname(candidate)
+              labels = normalized.split(".")
+              return (
+                  parsed_host.netloc == candidate
+                  and parsed_host.hostname is not None
+                  and normalized == normalize_hostname(parsed_host.hostname)
+                  and parsed_host.username is None
+                  and parsed_host.password is None
+                  and parsed_port is None
+                  and not parsed_host.path
+                  and not parsed_host.query
+                  and not parsed_host.fragment
+                  and len(normalized) <= 253
+                  and all(
+                      re.fullmatch(
+                          r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+                          label,
+                      )
+                      for label in labels
+                  )
+              )
+
           if (
               not url
               or not secret_key
               or secret_key == "dev-insecure-secret-change-me"
-              or not expected_host_raw
-              or expected_host_raw != expected_host_raw.strip()
+              or not expected_host_raw.strip()
               or not expected_name
               or expected_name != expected_name.strip()
           ):
@@ -72,8 +106,9 @@ jobs:
 
           try:
               parsed = urlsplit(url)
-              actual_host = (parsed.hostname or "").lower().rstrip(".")
-              expected_host = expected_host_raw.lower().rstrip(".")
+              actual_host = normalize_hostname(parsed.hostname or "")
+              expected_host = normalize_hostname(expected_host_raw)
+              expected_hostname_alone = is_hostname_alone(expected_host_raw)
               username = parsed.username
               password = parsed.password
               port = parsed.port
@@ -136,6 +171,7 @@ jobs:
               ("password_present", bool(password and decoded_password)),
               ("port_valid", 1 <= effective_port <= 65535),
               ("database_path_valid", valid_database_component),
+              ("expected_hostname_alone", expected_hostname_alone),
               ("expected_host_match", actual_host == expected_host),
               ("expected_database_match", database_name == expected_name),
               ("fragment_check", not parsed.fragment),
@@ -155,9 +191,15 @@ jobs:
               or not 1 <= effective_port <= 65535
               or parsed.fragment
               or not valid_database_component
+              or not expected_hostname_alone
               or actual_host != expected_host
               or database_name != expected_name
           ):
+              if actual_host != expected_host:
+                  print(
+                      "::notice::Ensure DATABASE_URL and EXPECTED_DATABASE_HOST "
+                      "come from the same Render External Database URL."
+                  )
               print("::error::Database target did not match the expected production identifier or required connection fields.")
               sys.exit(1)
 
