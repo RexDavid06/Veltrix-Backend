@@ -128,6 +128,22 @@ jobs:
 
           effective_port = 5432 if port is None else port
 
+          diagnostic_checks = (
+              ("scheme_check", parsed.scheme in {"postgres", "postgresql"}),
+              ("host_present", bool(actual_host)),
+              ("expected_host_present", bool(expected_host)),
+              ("username_present", bool(username and decoded_username)),
+              ("password_present", bool(password and decoded_password)),
+              ("port_valid", 1 <= effective_port <= 65535),
+              ("database_path_valid", valid_database_component),
+              ("expected_host_match", actual_host == expected_host),
+              ("expected_database_match", database_name == expected_name),
+              ("fragment_check", not parsed.fragment),
+              ("sslmode_check", sslmode in {"require", "verify-ca", "verify-full"}),
+          )
+          for label, passed in diagnostic_checks:
+              print(f"{label}={'PASS' if passed else 'FAIL'}")
+
           if (
               parsed.scheme not in {"postgres", "postgresql"}
               or not actual_host
