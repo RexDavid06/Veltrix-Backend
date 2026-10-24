@@ -551,10 +551,29 @@ class Deposit(models.Model):
     provider = models.ForeignKey(DepositProvider, on_delete=models.PROTECT, related_name="deposits")
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
     expected_amount = models.DecimalField(max_digits=MONEY_DIGITS[0], decimal_places=MONEY_DIGITS[1])
+    # NOWPayments prices customer orders in USD but quotes a distinct crypto
+    # pay-in amount. Keep those denominations separate from settlement fields.
+    price_amount = models.DecimalField(
+        max_digits=MONEY_DIGITS[0], decimal_places=MONEY_DIGITS[1], null=True, blank=True
+    )
+    price_currency = models.CharField(max_length=16, blank=True, default="")
+    quoted_amount = models.DecimalField(
+        max_digits=MONEY_DIGITS[0], decimal_places=MONEY_DIGITS[1], null=True, blank=True
+    )
+    quoted_currency = models.CharField(max_length=16, blank=True, default="")
+    quoted_network = models.CharField(max_length=32, blank=True, default="")
+    network_precision = models.PositiveSmallIntegerField(null=True, blank=True)
+    provider_fee_amount = models.DecimalField(
+        max_digits=MONEY_DIGITS[0], decimal_places=MONEY_DIGITS[1], null=True, blank=True
+    )
+    provider_fee_currency = models.CharField(max_length=16, blank=True, default="")
+    quote_expires_at = models.DateTimeField(null=True, blank=True)
+    quote_confirmed_at = models.DateTimeField(null=True, blank=True)
     received_amount = models.DecimalField(
         max_digits=MONEY_DIGITS[0], decimal_places=MONEY_DIGITS[1], null=True, blank=True
     )
     provider_ref = models.CharField(max_length=128, blank=True, default="")
+    provider_creation_uncertain = models.BooleanField(default=False)
     idempotency_key = models.CharField(max_length=64)
     source_currency = models.CharField(max_length=16, blank=True, default="")
     source_amount = models.DecimalField(

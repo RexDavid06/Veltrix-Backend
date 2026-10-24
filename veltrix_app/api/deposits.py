@@ -19,7 +19,7 @@ from veltrix_app.models import Asset, CryptoDeposit, Deposit, DepositProvider, N
 from veltrix_app.services.adapters import AdapterError, ProviderUnavailable, get_adapter
 from veltrix_app.services.deposits import (
     DepositError, check_amount, create_deposit_intent, credit_deposit,
-    reverse_deposit, send_to_manual_review, transition, verify_deposit,
+    reverse_deposit, send_to_manual_review, transition, validate_nowpayments_quote, verify_deposit,
 )
 
 
@@ -38,13 +38,39 @@ class IsClientAccount(permissions.BasePermission):
         )
 
 
+def _amount_text(value, places=None):
+    if value is None:
+        return None
+    text = f"{value:.{places}f}" if places is not None else format(value, "f")
+    return text if places is not None else (text.rstrip("0").rstrip(".") if "." in text else text)
+
+
 def public_deposit(deposit):
     crypto = getattr(deposit, "crypto", None)
+    instructions = dict(deposit.instructions or {})
+    # The client first reviews the USD and USDT quote, then explicitly confirms
+    # before the API returns the provider address.
+    if deposit.price_amount is not None and not deposit.quote_confirmed_at:
+        instructions.pop("address", None)
     return {
         "id": deposit.pk, "reference": deposit.reference, "asset": deposit.asset.code,
-        "network": crypto.network.chain if crypto else None, "expected_amount": str(deposit.expected_amount),
-        "received_amount": str(deposit.received_amount) if deposit.received_amount is not None else None,
-        "status": deposit.status, "instructions": deposit.instructions,
+        "network": crypto.network.chain if crypto else deposit.quoted_network or None,
+        "expected_amount": None if deposit.provider_creation_uncertain else _amount_text(deposit.expected_amount),
+        "provider_creation_uncertain": deposit.provider_creation_uncertain,
+        "price_amount": _amount_text(deposit.price_amount, 2),
+        "price_currency": deposit.price_currency.upper() or None,
+        "veltrix_fee_amount": _amount_text(deposit.fee_amount or Decimal("0"), 2),
+        "veltrix_fee_currency": "USD" if deposit.price_amount is not None else None,
+        "quoted_amount": _amount_text(deposit.quoted_amount),
+        "quoted_currency": deposit.quoted_currency.upper() or None,
+        "quoted_network": deposit.quoted_network or None,
+        "network_precision": deposit.network_precision,
+        "provider_fee_amount": _amount_text(deposit.provider_fee_amount),
+        "provider_fee_currency": deposit.provider_fee_currency.upper() or None,
+        "quote_expires_at": deposit.quote_expires_at,
+        "quote_confirmed": bool(deposit.quote_confirmed_at),
+        "received_amount": _amount_text(deposit.received_amount),
+        "status": deposit.status, "instructions": instructions,
         "transaction_hash": crypto.txid if crypto else "", "created_at": deposit.created_at,
         "updated_at": deposit.updated_at,
     }
@@ -69,13 +95,14 @@ class DepositListCreateAPIView(APIView):
     def post(self, request):
         if not getattr(settings, "FUNDING_DEPOSITS_ENABLED", False) or not getattr(settings, "NOWPAYMENTS_ENABLED", False):
             return Response({"detail": "USDT deposits are not enabled on this deployment."}, status=503)
-        amount_text = request.data.get("amount")
+        amount_text = request.data.get("amount_usd")
         try:
             amount = Decimal(str(amount_text))
-            if not amount.is_finite() or amount <= 0 or amount.as_tuple().exponent < -6:
+            if (not amount.is_finite() or amount <= 0
+                    or amount.quantize(Decimal("0.01")) != amount):
                 raise InvalidOperation
         except (InvalidOperation, TypeError, ValueError):
-            return Response({"detail": "Enter a valid positive USDT amount (up to 6 decimal places)."}, status=400)
+            return Response({"detail": "Enter a valid positive USD amount (up to 2 decimal places)."}, status=400)
         idempotency_key = request.headers.get("Idempotency-Key") or request.data.get("idempotency_key")
         if not idempotency_key or len(str(idempotency_key)) > 64:
             return Response({"detail": "A valid Idempotency-Key header is required."}, status=400)
@@ -101,6 +128,28 @@ class DepositDetailAPIView(APIView):
         return Response(public_deposit(deposit))
 
 
+class DepositQuoteConfirmAPIView(APIView):
+    permission_classes = (permissions.IsAuthenticated, IsClientAccount)
+
+    def post(self, request, pk):
+        with transaction.atomic():
+            deposit = get_object_or_404(
+                Deposit.objects.select_for_update().select_related("asset", "provider", "crypto__network"),
+                pk=pk, user=request.user, rail=Deposit.Rail.CRYPTO, provider__code="nowpayments",
+            )
+            if deposit.quote_expires_at is None or deposit.quote_expires_at <= timezone.now():
+                if deposit.status == Deposit.Status.PENDING:
+                    transition(deposit, Deposit.Status.EXPIRED, reason="NOWPayments quote expired before client confirmation.")
+                return Response({"detail": "This payment quote expired. Request a new quote."}, status=410)
+            problem = validate_nowpayments_quote(deposit)
+            if problem:
+                return Response({"detail": problem}, status=409)
+            if not deposit.quote_confirmed_at:
+                deposit.quote_confirmed_at = timezone.now()
+                deposit.save(update_fields=["quote_confirmed_at", "updated_at"])
+        return Response(public_deposit(deposit))
+
+
 @method_decorator(csrf_exempt, name="dispatch")
 class NowPaymentsWebhookAPIView(APIView):
     authentication_classes = ()
@@ -111,6 +160,9 @@ class NowPaymentsWebhookAPIView(APIView):
     def post(self, request):
         if not getattr(settings, "NOWPAYMENTS_ENABLED", False):
             return Response({"detail": "Webhook processing is disabled."}, status=503)
+        if (os.environ.get("NOWPAYMENTS_SANDBOX", "0") != "1"
+                and not getattr(settings, "NOWPAYMENTS_LIVE_AMOUNT_MODEL_APPROVED", False)):
+            return Response({"detail": "Live payment processing is disabled pending amount-model approval."}, status=503)
         provider = DepositProvider.objects.filter(code="nowpayments", rail=DepositProvider.Rail.CRYPTO).first()
         if provider is None:
             return Response({"detail": "Provider is not configured."}, status=503)
@@ -175,7 +227,8 @@ class NowPaymentsWebhookAPIView(APIView):
                     locked.source_currency = "USDT"
                     locked.save(update_fields=["source_amount", "source_currency", "updated_at"])
                 if status_text in ("partially_paid", "finished") and not verification.verified:
-                    if locked.status in (Deposit.Status.PENDING, Deposit.Status.DETECTED, Deposit.Status.VERIFYING):
+                    if locked.status in (Deposit.Status.PENDING, Deposit.Status.DETECTED, Deposit.Status.VERIFYING,
+                            Deposit.Status.EXPIRED, Deposit.Status.REJECTED):
                         send_to_manual_review(locked, reason=verification.reason or f"Provider payment amount mismatch: received {amount}.")
                 elif status_text == "finished" and verification.verified:
                     outcome_amount = Decimal(str(provider_data.get("outcome_amount")))

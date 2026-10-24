@@ -23,7 +23,7 @@ from .views import (
     WatchlistAPIView,
     WatchlistDetailAPIView,
 )
-from .deposits import DepositDetailAPIView, DepositListCreateAPIView, NowPaymentsWebhookAPIView
+from .deposits import DepositDetailAPIView, DepositListCreateAPIView, DepositQuoteConfirmAPIView, NowPaymentsWebhookAPIView
 from .verify import (
     PasswordResetConfirmAPIView,
     PasswordResetRequestAPIView,
@@ -46,6 +46,7 @@ urlpatterns = [
 
     path("deposits/", DepositListCreateAPIView.as_view(), name="api_deposits"),
     path("deposits/<int:pk>/", DepositDetailAPIView.as_view(), name="api_deposit_detail"),
+    path("deposits/<int:pk>/confirm/", DepositQuoteConfirmAPIView.as_view(), name="api_deposit_quote_confirm"),
     path("webhooks/nowpayments/", NowPaymentsWebhookAPIView.as_view(), name="api_nowpayments_webhook"),
 
     # Demo trading, funding, and watchlist

@@ -1,7 +1,8 @@
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import Client as DjangoClient, TestCase, override_settings
+from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -440,3 +441,82 @@ class ExistingSupportEndpointsStillWorkForAdmin(AdminAPIBase):
         self.assertEqual(self.client.get("/api/dashboard/").status_code, status.HTTP_200_OK)
         self.assertEqual(self.client.get("/api/watchlist/").status_code, status.HTTP_200_OK)
         self.assertEqual(self.client.post("/api/orders/", {}, format="json").status_code, status.HTTP_400_BAD_REQUEST)
+
+@override_settings(
+    STORAGES={
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    }
+)
+class ReadOnlyFinancialAdminTests(TestCase):
+    """Django admin may inspect but cannot mutate demo money records."""
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            username="readonly-admin@example.com",
+            email="readonly-admin@example.com",
+            password="Password123!",
+        )
+        self.client = DjangoClient()
+        self.client.force_login(self.admin)
+        self.account = DemoAccount.objects.create(
+            user=self.admin, currency="USD", cash_balance=Decimal("125.00")
+        )
+        self.instrument = Instrument.objects.create(
+            symbol="READONLY", name="Read Only", asset_class="Equity",
+            currency="USD", price=Decimal("10.00"),
+        )
+        self.transaction = Transaction.objects.create(
+            user=self.admin, instrument=self.instrument, symbol="READONLY",
+            side="buy", quantity=Decimal("1"), execution_price=Decimal("10.00"),
+            amount=Decimal("10.00"), status="simulated",
+        )
+
+    def _model_admin_urls(self, model):
+        opts = model._meta
+        base = f"admin:{opts.app_label}_{opts.model_name}"
+        return {
+            "changelist": reverse(f"{base}_changelist"),
+            "add": reverse(f"{base}_add"),
+            "change": reverse(f"{base}_change", args=[self.account.pk if model is DemoAccount else self.transaction.pk]),
+        }
+
+    def test_demo_accounts_remain_readable_but_cannot_be_added_or_changed(self):
+        from veltrix_app.models import DemoAccount
+
+        urls = self._model_admin_urls(DemoAccount)
+        self.assertEqual(self.client.get(urls["changelist"]).status_code, 200)
+        detail = self.client.get(urls["change"])
+        self.assertEqual(detail.status_code, 200)
+        self.assertContains(detail, "125.00")
+        self.assertEqual(self.client.get(urls["add"]).status_code, 403)
+        response = self.client.post(
+            urls["change"],
+            {"user": self.admin.pk, "currency": "USD", "cash_balance": "999.00", "_save": "Save"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.cash_balance, Decimal("125.00"))
+
+    def test_transactions_remain_readable_but_cannot_be_added_or_changed(self):
+        from veltrix_app.models import Transaction
+
+        urls = self._model_admin_urls(Transaction)
+        self.assertEqual(self.client.get(urls["changelist"]).status_code, 200)
+        detail = self.client.get(urls["change"])
+        self.assertEqual(detail.status_code, 200)
+        self.assertContains(detail, "READONLY")
+        self.assertEqual(self.client.get(urls["add"]).status_code, 403)
+        response = self.client.post(
+            urls["change"],
+            {
+                "user": self.admin.pk, "instrument": self.instrument.pk,
+                "symbol": "TAMPERED", "side": "buy", "quantity": "1",
+                "execution_price": "10.00", "amount": "999.00",
+                "status": "simulated", "_save": "Save",
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+        self.transaction.refresh_from_db()
+        self.assertEqual(self.transaction.symbol, "READONLY")
+        self.assertEqual(self.transaction.amount, Decimal("10.00"))

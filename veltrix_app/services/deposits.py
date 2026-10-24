@@ -192,22 +192,38 @@ def create_deposit_intent(
 
     existing = Deposit.objects.filter(user=user, idempotency_key=idempotency_key).first()
     if existing is not None:
+        existing_amount = existing.price_amount if provider.code == "nowpayments" else existing.expected_amount
         if (existing.provider_id != provider.id or existing.asset_id != asset.id
-                or existing.expected_amount != amount
+                or existing_amount != amount
                 or (network is not None and (not hasattr(existing, "crypto") or existing.crypto.network_id != network.id))):
             raise DepositError("This idempotency key was already used for a different deposit request.")
+        if existing.provider_creation_uncertain:
+            raise DepositError("A prior NOWPayments payment creation is unresolved. Reconcile it before requesting another deposit.")
+        if provider.code == "nowpayments" and validate_nowpayments_quote(existing):
+            raise DepositError("This NOWPayments quote expired or changed. Request a new quote.")
         return existing
 
     provider_assets = list(provider.supported_assets.all())
     if provider_assets and asset not in provider_assets:
         raise DepositError(f"Provider {provider.code} does not accept {asset.code}.")
 
-    if provider.min_deposit and amount < provider.min_deposit:
-        raise DepositError(f"Minimum deposit for {provider.code} is {provider.min_deposit} {asset.code}.")
-    if provider.max_deposit and amount > provider.max_deposit:
-        raise DepositError(f"Maximum deposit for {provider.code} is {provider.max_deposit} {asset.code}.")
-    if network is not None and network.min_deposit and amount < network.min_deposit:
-        raise DepositError(f"Minimum deposit for {network.chain} is {network.min_deposit} {asset.code}.")
+    if provider.code == "nowpayments":
+        if Deposit.objects.filter(user=user, provider=provider, provider_creation_uncertain=True).exists():
+            raise DepositError("A prior NOWPayments payment creation is unresolved. Reconcile it before requesting another deposit.")
+        # Provider/network minimums are denominated in the quoted crypto asset,
+        # while this request is a USD notional. Do not compare unlike units.
+        # NOWPayments will reject a below-minimum payment during creation.
+        if provider.fee_percent or provider.fee_fixed:
+            raise DepositError(
+                "NOWPayments Veltrix fees are unavailable until a separate fee collection flow is approved."
+            )
+    else:
+        if provider.min_deposit and amount < provider.min_deposit:
+            raise DepositError(f"Minimum deposit for {provider.code} is {provider.min_deposit} {asset.code}.")
+        if provider.max_deposit and amount > provider.max_deposit:
+            raise DepositError(f"Maximum deposit for {provider.code} is {provider.max_deposit} {asset.code}.")
+        if network is not None and network.min_deposit and amount < network.min_deposit:
+            raise DepositError(f"Minimum deposit for {network.chain} is {network.min_deposit} {asset.code}.")
 
     deposit = Deposit.objects.create(
         user=user,
@@ -215,11 +231,14 @@ def create_deposit_intent(
         asset=asset,
         provider=provider,
         expected_amount=amount,
+        price_amount=amount if provider.code == "nowpayments" else None,
+        price_currency="usd" if provider.code == "nowpayments" else "",
         idempotency_key=idempotency_key,
         reference=generate_reference(),
         provider_ref=generate_reference(),
-        fee_amount=Decimal(str(provider.fee_percent)) / Decimal("100") * amount
-        + Decimal(str(provider.fee_fixed)),
+        fee_amount=(ZERO if provider.code == "nowpayments" else
+            Decimal(str(provider.fee_percent)) / Decimal("100") * amount
+            + Decimal(str(provider.fee_fixed))),
     )
 
     if provider.rail == Deposit.Rail.BANK:
@@ -274,10 +293,29 @@ def _create_crypto_intent(deposit: Deposit, network: Network) -> None:
     if deposit.provider.code != "nowpayments":
         raise DepositError("No live crypto deposit provider is configured.")
     from veltrix_app.services.adapters import get_adapter
-    instructions = get_adapter(deposit.provider).create_intent(deposit)
-    address = instructions["address"]
-    CryptoDeposit.objects.create(deposit=deposit, network=network, address=address,
+    # Make the selected chain available to the adapter while it validates the
+    # provider quote; the outer transaction rolls this row back on any failure.
+    crypto = CryptoDeposit.objects.create(deposit=deposit, network=network, address="",
         required_confirmations=network.required_confirmations)
+    from veltrix_app.services.adapters import PaymentCreationUncertain
+    try:
+        instructions = get_adapter(deposit.provider).create_intent(deposit)
+    except PaymentCreationUncertain as exc:
+        deposit.provider_ref = exc.provider_ref
+        deposit.provider_creation_uncertain = True
+        deposit.instructions = {
+            "provider": "NOWPayments",
+            "order_id": deposit.reference,
+            "message": "Payment creation could not be confirmed. Do not submit another deposit until support reconciles this reference.",
+        }
+        send_to_manual_review(
+            deposit,
+            reason=f"NOWPayments payment creation is uncertain; reconcile order reference {deposit.reference} before retrying.",
+        )
+        deposit.save(update_fields=["provider_ref", "provider_creation_uncertain", "instructions", "updated_at"])
+        return
+    crypto.address = instructions["address"]
+    crypto.save(update_fields=["address"])
     deposit.instructions = instructions
     deposit.save(update_fields=["instructions"])
 
@@ -372,6 +410,39 @@ def send_to_manual_review(deposit: Deposit, *, reason: str, actor: User | None =
     return deposit
 
 
+def validate_nowpayments_quote(deposit: Deposit, *, now=None, require_confirmed=False) -> str | None:
+    """Return a safe reason if the persisted USD-to-USDT payment quote is unusable."""
+    now = now or timezone.now()
+    crypto = getattr(deposit, "crypto", None)
+    instructions = deposit.instructions or {}
+    try:
+        instruction_price = Decimal(str(instructions.get("price_amount")))
+        instruction_amount = Decimal(str(instructions.get("amount")))
+    except (InvalidOperation, TypeError, ValueError):
+        return "The payment quote is expired or its stored amount, currency, network, or provider reference changed."
+    if (deposit.provider.code != "nowpayments" or (require_confirmed and not deposit.quote_confirmed_at)
+            or deposit.price_amount is None
+            or deposit.price_amount <= ZERO or deposit.price_currency.lower() != "usd"
+            or deposit.quoted_amount is None or deposit.quoted_amount <= ZERO
+            or deposit.quoted_currency.lower() != "usdttrc20"
+            or deposit.expected_amount != deposit.quoted_amount
+            or (deposit.network_precision is not None and
+                deposit.quoted_amount != deposit.quoted_amount.quantize(Decimal(1).scaleb(-deposit.network_precision)))
+            or deposit.quoted_network.lower() != "tron (trc20)"
+            or not deposit.provider_ref or deposit.quote_expires_at is None
+            or not timezone.is_aware(deposit.quote_expires_at)
+            or (not deposit.quote_confirmed_at and deposit.quote_expires_at <= now)
+            or instruction_price != deposit.price_amount
+            or str(instructions.get("price_currency", "")).lower() != "usd"
+            or instruction_amount != deposit.quoted_amount
+            or str(instructions.get("currency", "")).upper() != "USDT"
+            or not crypto or crypto.network.chain.upper() != "TRON"
+            or crypto.network.token_standard.upper() != "TRC20"
+            or crypto.network.is_testnet):
+        return "The payment quote is expired or its stored amount, currency, network, or provider reference changed."
+    return None
+
+
 def check_amount(deposit: Deposit) -> str | None:
     """Compare what arrived against what was expected.
 
@@ -403,6 +474,8 @@ def credit_deposit(deposit: Deposit, *, actor: User | None = None) -> Deposit:
     """
     if deposit.is_credited:
         return deposit
+    if deposit.provider.code == "nowpayments" and (deposit.fee_amount or ZERO) != ZERO:
+        raise DepositError("NOWPayments Veltrix fees cannot be deducted from settlement.")
     if deposit.status not in (Deposit.Status.VERIFIED, Deposit.Status.MANUAL_REVIEW):
         raise InvalidTransition(
             f"Deposit {deposit.id} must be verified before it can be credited (is {deposit.status})."

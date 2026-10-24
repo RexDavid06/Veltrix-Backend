@@ -10,6 +10,23 @@ NOWPayments' current fee article lists 1% for payments without exchange, and 1.5
 
 NOWPayments requires an account, payout wallet, API key and IPN secret. Its API docs provide a Sandbox for simulated payment cases; the backend selects `https://api-sandbox.nowpayments.io` only when `NOWPAYMENTS_SANDBOX=1`. Sandbox events are deliberately blocked from real-ledger credit, and mocked tests do not establish live settlement or on-chain behavior.
 
+## Quote, fee, and retry status
+
+The client enters USD. The server creates a NOWPayments payment with `price_amount`, `price_currency=usd`, and `pay_currency=usdttrc20`, then persists the returned USD price, crypto `pay_amount`, pay currency, provider-reported network and precision, payment ID, and `expiration_estimate_date`. The address is withheld until the user confirms the quote before expiry. Webhook settlement fetches payment status from NOWPayments and compares it with the stored quote and provider identity; it does not treat USD and USDT as equal.
+
+The documented create-payment response does not include an itemized provider or network fee amount. The request uses the documented `is_fee_paid_by_user` option, but the exact merchant/account fee and settlement effect must still be confirmed in the merchant's sandbox/account. Veltrix does not subtract a configured Veltrix fee: nonzero provider fee settings block quote creation until a separate collection approach is approved.
+
+A timeout or unusable create-payment response is stored as an uncertain manual-review deposit. The API blocks repeat requests for that user while an uncertain request is unresolved. Support must reconcile using the order reference (and provider payment ID if returned) in the merchant dashboard before deciding whether any further request is safe. The API docs describe `order_id` as an order reference; they do not document it as a payment idempotency key or provide a documented safe recovery operation. No automatic retry or synthetic idempotency header is used.
+
+Live payment creation and live webhook settlement remain blocked by `NOWPAYMENTS_LIVE_AMOUNT_MODEL_APPROVED = False` in settings and by adapter/webhook checks. Environment flags alone cannot enable them. Migration 0004 only adds quote metadata and a default-false uncertainty flag; it does not reinterpret or backfill existing deposit amounts. The amount/date quote fields are nullable, while currency/network text fields default to blank. Existing deposits without stored quotes cannot pass the new strict settlement checks and require manual reconciliation.
+
+Product/finance must choose before any separate Veltrix fee is enabled:
+
+- Keep the Veltrix deposit fee at zero for this rail; or
+- Approve a separate fee collection mechanism and decide its amount, timing, failure/refund behavior, and ledger accounting.
+
+NOWPayments documents the user-paid provider fee option, but that covers provider fees and does not document a separate Veltrix fee charge. Do not silently add a fee to the USD amount or deduct it from USDT settlement. Also confirm the documented `fixed_rate` request field against the merchant's sandbox: the API reference's field description names `fixed_rate`, while its example body uses `is_fixed_rate`.
+
 ## Account and dashboard setup
 
 1. Create and complete the NOWPayments merchant account and any requested business/KYC review.
@@ -35,10 +52,12 @@ Set only in the backend secret manager/environment; never in React:
 - `NOWPAYMENTS_IPN_CALLBACK_URL` — public HTTPS webhook URL above
 - `NOWPAYMENTS_SANDBOX=1` only for sandbox credentials, otherwise `0`
 - `NOWPAYMENTS_ENABLED=1` and `FUNDING_DEPOSITS_ENABLED=1` to enable the provider path outside production
-- `FUNDING_LIVE_VERIFIED=1` only after the live account, payout destination, callbacks, verification, and wallet settlement have been operationally checked; production forces both funding flags off unless this is explicitly set
+- `FUNDING_LIVE_VERIFIED=1` only after the live account, payout destination, callbacks, verification, and wallet settlement have been operationally checked; production forces both funding flags off unless this is explicitly set, with an explicit valid `DEBUG=0` also required
 - `FUNDING_REQUIRE_KYC=1` (default)
 
-All funding flags default off. No live credentials or wallet were supplied in this repository task, so live funding remains disabled. The deployment owner must perform the dashboard and live settlement steps above. ## Sandbox verification procedure
+All funding flags default off. Live NOWPayments payment creation is additionally fail-closed pending the amount-model decision above. No production settings were inspected in this local task; Render configuration and live settlement remain unverified.
+
+## Sandbox verification procedure
 
 Use a local, non-production SQLite database (`DEBUG=1`, no `DATABASE_URL`) and a publicly reachable HTTPS tunnel/test host that forwards to this local backend. The callback must be exactly `https://<host>/api/webhooks/nowpayments/`. Do not set `FUNDING_LIVE_VERIFIED=1`.
 
@@ -64,4 +83,4 @@ python manage.py runserver 0.0.0.0:8000
 
 Before any live enablement, separately run a small real payment and verify NOWPayments reports `finished`, the exact owner outcome wallet and USDTTRC20 amount, the on-chain transaction in the owner's wallet, and the corresponding Veltrix ledger entry. Only then may the operator consider setting `FUNDING_LIVE_VERIFIED=1`; no live setting is enabled by this guide.
 
-The mocked test suite has passed. No NOWPayments sandbox payment or real on-chain transaction has been run in this repository session.
+The local mocked tests do not call NOWPayments. No NOWPayments sandbox payment or real on-chain transaction has been run in this repository session.

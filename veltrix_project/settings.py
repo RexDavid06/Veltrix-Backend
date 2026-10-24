@@ -15,7 +15,21 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 environ.Env.read_env(BASE_DIR / ".env")
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-me")
-DEBUG = os.environ.get("DEBUG", "1") == "1"
+_raw_debug = os.environ.get("DEBUG")
+_DEBUG_CONFIGURED = _raw_debug is not None and bool(_raw_debug.strip())
+if not _DEBUG_CONFIGURED:
+    # Missing DEBUG must never turn on debug in a deployed service. Production
+    # also requires a real SECRET_KEY below, so an incomplete deployment fails
+    # closed rather than silently running with development settings.
+    DEBUG = False
+else:
+    _normalized_debug = _raw_debug.strip().lower()
+    if _normalized_debug in {"1", "true", "yes", "on"}:
+        DEBUG = True
+    elif _normalized_debug in {"0", "false", "no", "off"}:
+        DEBUG = False
+    else:
+        raise ImproperlyConfigured("DEBUG must be an explicit boolean value.")
 # Read ALLOWED_HOSTS from the environment (comma-separated). If the variable is
 # not provided (e.g. Render dashboard), fall back to a safe default that keeps
 # localhost and the known Render hostname for this deployment. Prefer an
@@ -47,7 +61,7 @@ if DEBUG and "*" not in _deduped:
 ALLOWED_HOSTS = _deduped
 
 # Security: require SECRET_KEY in production
-if not DEBUG and SECRET_KEY == "dev-insecure-secret-change-me":
+if not DEBUG and (not SECRET_KEY.strip() or SECRET_KEY == "dev-insecure-secret-change-me"):
     raise ImproperlyConfigured("SECRET_KEY must be set in production environment")
 
 INSTALLED_APPS = [
@@ -201,11 +215,19 @@ if FUNDING_DEMO_TOPUP_ENABLED and _funding_is_production_deployment:
 FUNDING_DEPOSITS_ENABLED = os.environ.get("FUNDING_DEPOSITS_ENABLED", "0") == "1"
 NOWPAYMENTS_ENABLED = os.environ.get("NOWPAYMENTS_ENABLED", "0") == "1"
 FUNDING_REQUIRE_KYC = os.environ.get("FUNDING_REQUIRE_KYC", "1") == "1"
+NOWPAYMENTS_SANDBOX = os.environ.get("NOWPAYMENTS_SANDBOX", "0") == "1"
+# Hard code this off until the submitted amount's USD pricing, USDT outcome,
+# and ledger fee semantics have one approved and tested model. Environment
+# configuration alone must not bypass that unresolved financial contract.
+NOWPAYMENTS_LIVE_AMOUNT_MODEL_APPROVED = False
 # Live production funding requires a separate operator attestation after wallet,
 # callback, provider account and settlement have been verified. Sandbox remains
 # available in non-production environments without this production switch.
 FUNDING_LIVE_VERIFIED = os.environ.get("FUNDING_LIVE_VERIFIED", "0") == "1"
-if not DEBUG and not FUNDING_LIVE_VERIFIED:
+_funding_is_production = (not DEBUG) or bool(DATABASE_URL)
+_live_funding_requested = not NOWPAYMENTS_SANDBOX
+_live_funding_approved = _DEBUG_CONFIGURED and not DEBUG and FUNDING_LIVE_VERIFIED
+if ((_funding_is_production or _live_funding_requested) and not _live_funding_approved):
     FUNDING_DEPOSITS_ENABLED = False
     NOWPAYMENTS_ENABLED = False
 

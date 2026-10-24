@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -427,57 +428,114 @@ class DemoTopUpFundingToggleTests(TestCase):
 
 
 class DemoFundingProductionGuardTests(TestCase):
-    """A production deployment must never be able to enable simulated funding.
+    """Settings-load safety tests run in fresh processes with synthetic config."""
 
-    The safety valve runs at settings load time, so these tests load a fresh
-    copy of the settings module in a subprocess with a controlled environment.
-    """
-
-    def _load_funding_setting(self, env_overrides):
-        # Import the settings module directly rather than calling django.setup():
-        # setup() would try to load the database backend, which is unnecessary
-        # here and unavailable in some environments (e.g. no psycopg2).
+    def _load_funding_config(self, env_overrides):
         code = (
-            "import veltrix_project.settings as s;"
-            "print(s.FUNDING_DEMO_TOPUP_ENABLED)"
+            "import environ; environ.Env.read_env = lambda *args, **kwargs: None; "
+            "import json; import veltrix_project.settings as s; "
+            "print(json.dumps({"
+            "'debug': s.DEBUG, 'debug_configured': s._DEBUG_CONFIGURED, "
+            "'deposits': s.FUNDING_DEPOSITS_ENABLED, "
+            "'nowpayments': s.NOWPAYMENTS_ENABLED, "
+            "'amount_model_approved': s.NOWPAYMENTS_LIVE_AMOUNT_MODEL_APPROVED, "
+            "'demo_topup': s.FUNDING_DEMO_TOPUP_ENABLED"
+            "}))"
         )
         env = dict(os.environ)
-        # Deterministic baseline for the scenario under test.
-        env.pop("FUNDING_DEMO_TOPUP_ENABLED", None)
-        env.pop("DATABASE_URL", None)
+        for key in (
+            "FUNDING_DEMO_TOPUP_ENABLED", "DATABASE_URL", "FUNDING_DEPOSITS_ENABLED",
+            "NOWPAYMENTS_ENABLED", "FUNDING_LIVE_VERIFIED", "NOWPAYMENTS_SANDBOX",
+        ):
+            env.pop(key, None)
         env["DJANGO_SETTINGS_MODULE"] = "veltrix_project.settings"
         env["DEBUG"] = "1"
-        env["SECRET_KEY"] = "test-only-secret"
-        env.update(env_overrides)
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=str(settings.BASE_DIR),
-            env=env,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return result.stdout.strip()
-
-    def test_production_debug_off_forces_funding_off(self):
-        self.assertEqual(
-            self._load_funding_setting({"DEBUG": "0", "FUNDING_DEMO_TOPUP_ENABLED": "1"}),
-            "False",
+        env["SECRET_KEY"] = "synthetic-local-settings-test-key"
+        for key, value in env_overrides.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
+        return subprocess.run(
+            [sys.executable, "-c", code], cwd=str(settings.BASE_DIR), env=env,
+            capture_output=True, text=True, check=False,
         )
 
-    def test_production_with_database_url_forces_funding_off_even_if_debug_defaults(self):
-        self.assertEqual(
-            self._load_funding_setting(
-                {"DATABASE_URL": "postgres://user:pass@localhost/veltrix", "FUNDING_DEMO_TOPUP_ENABLED": "1"}
-            ),
-            "False",
-        )
+    def _config(self, env_overrides):
+        result = self._load_funding_config(env_overrides)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
 
-    def test_local_dev_can_explicitly_enable_funding(self):
-        self.assertEqual(
-            self._load_funding_setting({"DEBUG": "1", "FUNDING_DEMO_TOPUP_ENABLED": "1"}),
-            "True",
-        )
+    def test_production_debug_off_forces_demo_funding_off(self):
+        config = self._config({
+            "DEBUG": "0", "DATABASE_URL": "postgresql://test:test@localhost/veltrix",
+            "FUNDING_DEMO_TOPUP_ENABLED": "1",
+        })
+        self.assertFalse(config["demo_topup"])
+
+    def test_production_database_forces_demo_funding_off(self):
+        config = self._config({
+            "DATABASE_URL": "postgresql://test:test@localhost/veltrix",
+            "FUNDING_DEMO_TOPUP_ENABLED": "1",
+        })
+        self.assertFalse(config["demo_topup"])
+
+    def test_local_dev_can_explicitly_enable_demo_funding(self):
+        config = self._config({"DEBUG": "1", "FUNDING_DEMO_TOPUP_ENABLED": "1"})
+        self.assertTrue(config["demo_topup"])
+
+    def test_missing_debug_fails_closed_even_with_live_approval(self):
+        config = self._config({
+            "DEBUG": None, "DATABASE_URL": "postgresql://test:test@localhost/veltrix",
+            "FUNDING_DEPOSITS_ENABLED": "1", "NOWPAYMENTS_ENABLED": "1",
+            "FUNDING_LIVE_VERIFIED": "1", "NOWPAYMENTS_SANDBOX": "0",
+        })
+        self.assertFalse(config["debug"])
+        self.assertFalse(config["debug_configured"])
+        self.assertFalse(config["deposits"])
+        self.assertFalse(config["nowpayments"])
+
+    def test_debug_true_blocks_live_funding_even_with_live_approval(self):
+        config = self._config({
+            "DEBUG": "true", "DATABASE_URL": "postgresql://test:test@localhost/veltrix",
+            "FUNDING_DEPOSITS_ENABLED": "1", "NOWPAYMENTS_ENABLED": "1",
+            "FUNDING_LIVE_VERIFIED": "1", "NOWPAYMENTS_SANDBOX": "0",
+        })
+        self.assertTrue(config["debug"])
+        self.assertFalse(config["deposits"])
+        self.assertFalse(config["nowpayments"])
+
+    def test_live_approval_false_blocks_production_funding(self):
+        config = self._config({
+            "DEBUG": "0", "DATABASE_URL": "postgresql://test:test@localhost/veltrix",
+            "FUNDING_DEPOSITS_ENABLED": "1", "NOWPAYMENTS_ENABLED": "1",
+            "FUNDING_LIVE_VERIFIED": "0", "NOWPAYMENTS_SANDBOX": "0",
+        })
+        self.assertFalse(config["deposits"])
+        self.assertFalse(config["nowpayments"])
+
+    def test_explicitly_approved_production_can_enable_funding(self):
+        config = self._config({
+            "DEBUG": "0", "DATABASE_URL": "postgresql://test:test@localhost/veltrix",
+            "FUNDING_DEPOSITS_ENABLED": "1", "NOWPAYMENTS_ENABLED": "1",
+            "FUNDING_LIVE_VERIFIED": "1", "NOWPAYMENTS_SANDBOX": "0",
+        })
+        self.assertFalse(config["debug"])
+        self.assertTrue(config["debug_configured"])
+        self.assertTrue(config["deposits"])
+        self.assertTrue(config["nowpayments"])
+        self.assertFalse(config["amount_model_approved"])
+        self.assertFalse(config["demo_topup"])
+
+    def test_missing_debug_and_secret_key_fail_startup(self):
+        result = self._load_funding_config({"DEBUG": None, "SECRET_KEY": ""})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SECRET_KEY must be set in production environment", result.stderr)
+
+    def test_invalid_debug_fails_startup(self):
+        result = self._load_funding_config({"DEBUG": "sometimes"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DEBUG must be an explicit boolean value", result.stderr)
 
 
 class ConversationMessageContractTests(TestCase):

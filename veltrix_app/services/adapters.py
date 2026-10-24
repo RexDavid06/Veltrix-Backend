@@ -35,6 +35,9 @@ from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit
 
 import requests
+from django.conf import settings
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from veltrix_app.models import Deposit, DepositProvider, User
 
@@ -45,6 +48,14 @@ class AdapterError(Exception):
 
 class ProviderUnavailable(AdapterError):
     """Raised when the provider is not configured or not reachable."""
+
+
+class PaymentCreationUncertain(AdapterError):
+    """The provider may have created a payment but its response was unusable."""
+
+    def __init__(self, message, provider_ref=""):
+        super().__init__(message)
+        self.provider_ref = str(provider_ref or "")[:128]
 
 
 @dataclass
@@ -171,6 +182,13 @@ class CryptoAdapter(BaseAdapter):
     def create_intent(self, deposit: Deposit) -> dict:
         if self.provider.code != "nowpayments":
             raise ProviderUnavailable("No crypto provider is configured.")
+        if (os.environ.get("NOWPAYMENTS_SANDBOX", "0") != "1"
+                and not getattr(settings, "NOWPAYMENTS_LIVE_AMOUNT_MODEL_APPROVED", False)):
+            # Keep live creation disabled until both the USD-to-USDT settlement
+            # and separate Veltrix fee contracts are approved.
+            raise ProviderUnavailable(
+                "Live NOWPayments deposits are disabled pending amount and fee-model approval."
+            )
         api_key = os.environ.get("NOWPAYMENTS_API_KEY", "").strip()
         secret = os.environ.get("NOWPAYMENTS_IPN_SECRET", "").strip()
         callback_url = os.environ.get("NOWPAYMENTS_IPN_CALLBACK_URL", "").strip()
@@ -180,9 +198,11 @@ class CryptoAdapter(BaseAdapter):
                 or not callback.netloc or callback.username or callback.password
                 or not is_tron_address(payout_wallet)):
             raise ProviderUnavailable("NOWPayments configuration requires API credentials, an HTTPS callback URL, and a valid TRON payout wallet.")
-        request_data = {"price_amount": str(deposit.expected_amount), "price_currency": "usd",
+        if deposit.price_amount is None or deposit.price_amount <= 0 or deposit.price_currency.lower() != "usd":
+            raise ProviderUnavailable("NOWPayments requires a positive USD price amount.")
+        request_data = {"price_amount": str(deposit.price_amount), "price_currency": "usd",
             "pay_currency": "usdttrc20", "payout_address": payout_wallet,
-            "payout_currency": "usdttrc20", "is_fixed_rate": True,
+            "payout_currency": "usdttrc20", "fixed_rate": True,
             "is_fee_paid_by_user": True, "order_id": deposit.reference,
             "order_description": f"Veltrix deposit {deposit.reference}",
             "ipn_callback_url": callback_url}
@@ -198,24 +218,70 @@ class CryptoAdapter(BaseAdapter):
             data = response.json()
             if not isinstance(data, dict):
                 raise ValueError("Expected JSON object")
-        except (requests.RequestException, ValueError) as exc:
-            raise ProviderUnavailable("NOWPayments could not create the payment. Retry safely.") from exc
+        except requests.RequestException as exc:
+            raise PaymentCreationUncertain(
+                "NOWPayments did not confirm payment creation. Reconcile this request before another deposit.",
+            ) from exc
+        except ValueError as exc:
+            raise PaymentCreationUncertain(
+                "NOWPayments returned an unreadable creation response. Reconcile this request before another deposit.",
+            ) from exc
         payment_id = str(data.get("payment_id") or "")
         address = str(data.get("pay_address") or "")
-        if not payment_id or not is_tron_address(address) or str(data.get("pay_currency", "")).lower() != "usdttrc20":
-            raise ProviderUnavailable("NOWPayments returned incomplete or unexpected USDTTRC20 instructions.")
+        if (not payment_id or not is_tron_address(address)
+                or str(data.get("pay_currency", "")).lower() != "usdttrc20"
+                or str(data.get("price_currency", "")).lower() != "usd"):
+            raise PaymentCreationUncertain(
+                "NOWPayments may have created a payment but returned incomplete or unexpected instructions. Reconcile this request.",
+                payment_id,
+            )
         try:
+            returned_price = Decimal(str(data.get("price_amount")))
             amount = Decimal(str(data.get("pay_amount")))
-            if not amount.is_finite() or amount <= 0:
+            if (not returned_price.is_finite() or returned_price != deposit.price_amount
+                    or not amount.is_finite() or amount <= 0):
                 raise InvalidOperation
-        except (InvalidOperation, TypeError):
-            raise ProviderUnavailable("NOWPayments returned an invalid payment amount.")
+        except (InvalidOperation, TypeError, ValueError):
+            raise PaymentCreationUncertain(
+                "NOWPayments may have created a payment but returned invalid quote amounts. Reconcile this request.",
+                payment_id,
+            )
+        provider_network = data.get("network")
+        if not isinstance(provider_network, str) or not provider_network.strip():
+            raise PaymentCreationUncertain(
+                "NOWPayments may have created a payment but omitted its network. Reconcile this request.", payment_id
+            )
+        precision = data.get("network_precision")
+        if precision is not None:
+            if isinstance(precision, bool) or not isinstance(precision, int) or not 0 <= precision <= 18:
+                raise PaymentCreationUncertain("NOWPayments returned invalid network precision. Reconcile this request.", payment_id)
+            if precision != 6:
+                raise PaymentCreationUncertain("NOWPayments network precision does not match USDT TRC20. Reconcile this request.", payment_id)
+            if amount != amount.quantize(Decimal("0.000001")):
+                raise PaymentCreationUncertain("NOWPayments quote exceeds USDT TRC20 precision. Reconcile this request.", payment_id)
+        expires_at = parse_datetime(str(data.get("expiration_estimate_date") or ""))
+        if not expires_at or not timezone.is_aware(expires_at) or expires_at <= timezone.now():
+            raise PaymentCreationUncertain("NOWPayments omitted or returned an invalid quote expiry. Reconcile this request.", payment_id)
         deposit.provider_ref = payment_id
+        deposit.expected_amount = amount
+        deposit.quoted_amount = amount
+        deposit.quoted_currency = "usdttrc20"
+        deposit.quoted_network = "TRON (TRC20)"
+        deposit.network_precision = precision
+        deposit.quote_expires_at = expires_at
+        deposit.provider_fee_amount = None  # The documented response does not itemize provider/network fees.
+        deposit.provider_fee_currency = ""
         deposit.instructions = {"provider": "NOWPayments", "network": "TRON (TRC20)", "asset": "USDT",
             "address": address, "amount": str(amount), "currency": "USDT",
-            "expires_at": data.get("expiration_estimate_date"),
-            "note": "The displayed amount includes the provider fee when charged to the payer. Send exactly this USDT amount on TRON (TRC20); wallet network fees may be extra. Other networks are not supported."}
-        deposit.save(update_fields=["provider_ref", "instructions", "updated_at"])
+            "price_amount": str(deposit.price_amount), "price_currency": "USD",
+            "provider_network": provider_network.strip().lower(),
+            "network_precision": precision,
+            "expires_at": expires_at.isoformat(),
+            "provider_fee_amount": None, "provider_fee_currency": "",
+            "note": "Send exactly the quoted USDT amount on TRON (TRC20). NOWPayments' payer-fee option is enabled; its response does not itemize provider or network fees. Your wallet may charge a separate network fee."}
+        deposit.save(update_fields=["provider_ref", "expected_amount", "quoted_amount", "quoted_currency",
+            "quoted_network", "network_precision", "quote_expires_at", "provider_fee_amount",
+            "provider_fee_currency", "instructions", "updated_at"])
         return dict(deposit.instructions)
 
     def detect(self, deposit: Deposit) -> DetectionResult:
@@ -231,26 +297,38 @@ class CryptoAdapter(BaseAdapter):
     def verify(self, deposit: Deposit) -> VerificationResult:
         data = self._get_payment(deposit)
         payment_status = str(data.get("payment_status", "")).lower()
+        from veltrix_app.services.deposits import validate_nowpayments_quote
+        quote_problem = validate_nowpayments_quote(deposit, require_confirmed=True)
+        if quote_problem:
+            return VerificationResult(False, reason=quote_problem, raw=data)
+        instructions = deposit.instructions or {}
+        provider_network = str(instructions.get("provider_network") or "").strip().lower()
+        status_network = str(data.get("network") or "").strip().lower()
         if (str(data.get("payment_id")) != deposit.provider_ref
                 or str(data.get("order_id", "")) != deposit.reference
+                or str(data.get("price_currency", "")).lower() != "usd"
                 or str(data.get("pay_currency", "")).lower() != "usdttrc20"
-                or str(data.get("pay_address", "")) != str((deposit.instructions or {}).get("address", ""))):
-            return VerificationResult(False, reason="Provider payment identity, network, token, or recipient mismatch.", raw=data)
+                or str(data.get("pay_address", "")) != str(instructions.get("address", ""))
+                or (provider_network and status_network != provider_network)):
+            return VerificationResult(False, reason="Provider payment identity, price, network, token, or recipient mismatch.", raw=data)
         try:
+            price_amount = Decimal(str(data.get("price_amount")))
             amount = Decimal(str(data.get("actually_paid") or "0"))
-            provider_pay_amount = Decimal(str(data.get("pay_amount"))) if data.get("pay_amount") is not None else None
+            provider_pay_amount = Decimal(str(data.get("pay_amount")))
             outcome_amount = Decimal(str(data.get("outcome_amount"))) if data.get("outcome_amount") is not None else None
-            requested_pay_amount = Decimal(str((deposit.instructions or {}).get("amount", deposit.expected_amount)))
-        except InvalidOperation:
-            amount = Decimal("0")
-            provider_pay_amount = None
-            outcome_amount = None
-            requested_pay_amount = deposit.expected_amount
+            requested_pay_amount = deposit.quoted_amount
+        except (InvalidOperation, TypeError, ValueError):
+            return VerificationResult(False, reason="Provider returned an invalid amount.", raw=data)
         outcome_currency = str(data.get("outcome_currency") or "").lower()
-        if provider_pay_amount is not None and provider_pay_amount != requested_pay_amount:
-            return VerificationResult(False, reason="Provider pay-in amount changed after payment creation.", raw=data)
-        if payment_status == "finished" and (outcome_amount != deposit.expected_amount or outcome_currency != "usdttrc20"):
-            return VerificationResult(False, reason="Settled owner-wallet amount or currency does not match the deposit.", raw=data)
+        # USD price has cents precision; USDT TRC20 amounts use the asset's
+        # six decimal places. Decimal equality intentionally does not equate
+        # the USD price to the USDT payable or settlement amount.
+        if price_amount != deposit.price_amount:
+            return VerificationResult(False, reason="Provider USD price changed after quote creation.", raw=data)
+        if provider_pay_amount != requested_pay_amount:
+            return VerificationResult(False, reason="Provider USDT pay-in amount changed after quote creation.", raw=data)
+        if payment_status == "finished" and (outcome_amount != requested_pay_amount or outcome_currency != "usdttrc20"):
+            return VerificationResult(False, reason="Settled USDT amount or currency does not match the stored quote.", raw=data)
         if payment_status == "partially_paid" or (payment_status == "finished" and amount < requested_pay_amount):
             return VerificationResult(False, reason="Underpaid provider payment.", raw=data)
         if payment_status == "finished" and amount > requested_pay_amount:

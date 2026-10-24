@@ -19,7 +19,7 @@ from django.test import TestCase
 from rest_framework import status
 from rest_framework.test import APIClient
 
-from veltrix_app.models import DemoAccount
+from veltrix_app.models import DemoAccount, Instrument, Position, Transaction
 
 User = get_user_model()
 
@@ -242,3 +242,48 @@ class InactiveAccountTests(ProfileSelfServiceBase):
         # And even a token issued before deactivation cannot be used.
         res = self.client.get(URL, HTTP_AUTHORIZATION="Bearer stale-token")
         self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+class DashboardAccountIsolationTests(ProfileSelfServiceBase):
+    def setUp(self):
+        super().setUp()
+        self.instrument = Instrument.objects.create(
+            symbol="ISO-A",
+            name="Isolation A",
+            asset_class="Equity",
+            currency="USD",
+            price=Decimal("10.00"),
+        )
+        Position.objects.create(
+            user=self.user, instrument=self.instrument,
+            quantity=Decimal("2"), avg_price=Decimal("8.00"),
+        )
+        Position.objects.create(
+            user=self.other, instrument=self.instrument,
+            quantity=Decimal("9"), avg_price=Decimal("7.00"),
+        )
+        self.own_transaction = Transaction.objects.create(
+            user=self.user, instrument=self.instrument, symbol="ISO-A", side="buy",
+            quantity=Decimal("2"), execution_price=Decimal("10.00"),
+            amount=Decimal("20.00"), status="simulated", note="owner-a",
+        )
+        self.other_transaction = Transaction.objects.create(
+            user=self.other, instrument=self.instrument, symbol="ISO-A", side="buy",
+            quantity=Decimal("9"), execution_price=Decimal("10.00"),
+            amount=Decimal("90.00"), status="simulated", note="owner-b",
+        )
+
+    def test_dashboard_only_returns_authenticated_users_account_positions_and_transactions(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/api/dashboard/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.json()
+        self.assertEqual(body["account"]["cash_balance"], "250.00")
+        self.assertEqual([row["quantity"] for row in body["positions"]], ["2.00000000"])
+        self.assertEqual([row["id"] for row in body["transactions"]], [self.own_transaction.id])
+        self.assertNotIn(self.other_transaction.id, [row["id"] for row in body["transactions"]])
+        self.assertNotIn("owner-b", str(body))
+
+    def test_dashboard_requires_authentication(self):
+        response = self.client.get("/api/dashboard/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)

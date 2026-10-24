@@ -5,6 +5,25 @@ from django.contrib import admin
 from .models import AuditLog, DemoAccount, Instrument, Position, SupportTicket, Transaction, User, WatchlistItem
 
 
+class ReadOnlyFinancialRecordsAdmin(admin.ModelAdmin):
+    """Allow authorized staff to inspect these records without changing them."""
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def has_view_permission(self, request, obj=None):
+        opts = self.opts
+        return request.user.has_perm(
+            f"{opts.app_label}.view_{opts.model_name}"
+        ) or request.user.has_perm(f"{opts.app_label}.change_{opts.model_name}")
+
+
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
     list_display = ("username", "email", "role", "is_staff", "is_active")
@@ -13,8 +32,9 @@ class UserAdmin(admin.ModelAdmin):
 
 
 @admin.register(DemoAccount)
-class DemoAccountAdmin(admin.ModelAdmin):
+class DemoAccountAdmin(ReadOnlyFinancialRecordsAdmin):
     list_display = ("user", "currency", "cash_balance")
+    readonly_fields = tuple(field.name for field in DemoAccount._meta.fields)
 
 
 @admin.register(Instrument)
@@ -30,9 +50,10 @@ class PositionAdmin(admin.ModelAdmin):
 
 
 @admin.register(Transaction)
-class TransactionAdmin(admin.ModelAdmin):
+class TransactionAdmin(ReadOnlyFinancialRecordsAdmin):
     list_display = ("user", "symbol", "side", "quantity", "amount", "status", "created_at")
     list_filter = ("side", "status")
+    readonly_fields = tuple(field.name for field in Transaction._meta.fields)
 
 
 @admin.register(WatchlistItem)
