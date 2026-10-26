@@ -268,7 +268,10 @@ class NowPaymentsCallbackTests(TestCase):
         self.assertEqual(ledger.ledger_balance(self.user, self.asset), Decimal("0"))
 
 
-@override_settings(FUNDING_DEPOSITS_ENABLED=True, NOWPAYMENTS_ENABLED=True, FUNDING_REQUIRE_KYC=False)
+@override_settings(
+    FUNDING_DEPOSITS_ENABLED=True, NOWPAYMENTS_ENABLED=True,
+    FUNDING_REQUIRE_KYC=False, CRYPTO_DEPOSIT_MODE="nowpayments",
+)
 class NowPaymentsIntentTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(username="intent@example.com", email="intent@example.com", password="secret")

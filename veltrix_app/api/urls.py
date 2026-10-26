@@ -23,7 +23,15 @@ from .views import (
     WatchlistAPIView,
     WatchlistDetailAPIView,
 )
-from .deposits import DepositDetailAPIView, DepositListCreateAPIView, DepositQuoteConfirmAPIView, NowPaymentsWebhookAPIView
+from .deposits import (
+    BankDepositCreateAPIView,
+    DepositConfigAPIView,
+    DepositDetailAPIView,
+    DepositListCreateAPIView,
+    DepositQuoteConfirmAPIView,
+    DepositTxidAPIView,
+    NowPaymentsWebhookAPIView,
+)
 from .verify import (
     PasswordResetConfirmAPIView,
     PasswordResetRequestAPIView,
@@ -45,7 +53,10 @@ urlpatterns = [
     path("market/", MarketAPIView.as_view(), name="api_market"),
 
     path("deposits/", DepositListCreateAPIView.as_view(), name="api_deposits"),
+    path("deposits/config/", DepositConfigAPIView.as_view(), name="api_deposit_config"),
+    path("deposits/bank/", BankDepositCreateAPIView.as_view(), name="api_bank_deposit_create"),
     path("deposits/<int:pk>/", DepositDetailAPIView.as_view(), name="api_deposit_detail"),
+    path("deposits/<int:pk>/txid/", DepositTxidAPIView.as_view(), name="api_deposit_txid"),
     path("deposits/<int:pk>/confirm/", DepositQuoteConfirmAPIView.as_view(), name="api_deposit_quote_confirm"),
     path("webhooks/nowpayments/", NowPaymentsWebhookAPIView.as_view(), name="api_nowpayments_webhook"),
 

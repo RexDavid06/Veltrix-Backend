@@ -623,7 +623,12 @@ class Deposit(models.Model):
 
     @property
     def is_credited(self):
-        return self.status in self.CREDITED_STATES
+        # A credited deposit may be moved to manual review after a chain
+        # reorganization; its immutable ledger entry remains credited pending
+        # operator reconciliation.
+        return self.status in self.CREDITED_STATES or (
+            self.status == self.Status.MANUAL_REVIEW and self.ledger_entry_id is not None
+        )
 
     @property
     def net_amount(self):
@@ -634,10 +639,11 @@ class Deposit(models.Model):
 
 
 class DepositAddress(models.Model):
-    """A crypto deposit address assigned to one client on one network."""
+    """Legacy per-deposit address record; the direct TRON rail uses one shared address."""
 
     user = models.ForeignKey(User, on_delete=models.PROTECT, related_name="deposit_addresses")
     network = models.ForeignKey(Network, on_delete=models.PROTECT, related_name="deposit_addresses")
+    deposit = models.OneToOneField(Deposit, null=True, blank=True, on_delete=models.PROTECT, related_name="assigned_address")
     address = models.CharField(max_length=256)
     memo = models.CharField(max_length=64, blank=True, default="")
     provider_ref = models.CharField(max_length=128, blank=True, default="")
@@ -656,7 +662,14 @@ class DepositAddress(models.Model):
 
 
 class CryptoDeposit(models.Model):
-    """Chain-specific details for a crypto deposit."""
+    """Chain-specific details for a crypto deposit.
+
+    For the shared-address TRON rail, ``address`` is the one configured
+    receiving wallet, not a client-specific address. ``requested_amount`` is
+    what the client asked to deposit; ``payable_amount`` is what they must send
+    exactly (it may carry an optional unique micro-USDT suffix). The
+    authoritative expected amount remains ``Deposit.expected_amount``.
+    """
 
     deposit = models.OneToOneField(Deposit, on_delete=models.CASCADE, related_name="crypto")
     network = models.ForeignKey(Network, on_delete=models.PROTECT, related_name="crypto_deposits")
@@ -666,6 +679,18 @@ class CryptoDeposit(models.Model):
     vout = models.CharField(max_length=32, blank=True, default="")
     confirmations = models.PositiveIntegerField(default=0)
     required_confirmations = models.PositiveIntegerField(default=3)
+    requested_amount = models.DecimalField(
+        max_digits=MONEY_DIGITS[0], decimal_places=MONEY_DIGITS[1], null=True, blank=True
+    )
+    payable_amount = models.DecimalField(
+        max_digits=MONEY_DIGITS[0], decimal_places=MONEY_DIGITS[1], null=True, blank=True
+    )
+    unique_amount_suffix = models.PositiveIntegerField(default=0)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    # Client-supplied claim only. It is never treated as proof of ownership or
+    # of an on-chain transfer until independently discovered and verified.
+    submitted_txid = models.CharField(max_length=128, blank=True, default="")
+    submitted_at = models.DateTimeField(null=True, blank=True)
     detected_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
@@ -676,19 +701,101 @@ class CryptoDeposit(models.Model):
                 name="uniq_crypto_deposit_event",
             )
         ]
+        indexes = [models.Index(fields=["submitted_txid"])]
 
     def __str__(self):
         return f"CryptoDeposit({self.deposit_id}, {self.txid[:12]})"
 
 
+class ChainScanCursor(models.Model):
+    """Durable progress for one configured network/token event stream.
+
+    ``timestamp`` is the lower bound (inclusive) for the next fresh scan. While
+    a paginated window is in flight, ``window_start_timestamp`` and
+    ``window_end_timestamp`` must be replayed unchanged together with the
+    provider fingerprint. ``block_number`` is informational only.
+    """
+
+    network = models.OneToOneField(Network, on_delete=models.PROTECT, related_name="scan_cursor")
+    block_number = models.PositiveBigIntegerField(default=0)
+    timestamp = models.PositiveBigIntegerField(default=0)
+    fingerprint = models.CharField(max_length=512, blank=True, default="")
+    window_start_timestamp = models.PositiveBigIntegerField(null=True, blank=True)
+    window_end_timestamp = models.PositiveBigIntegerField(null=True, blank=True)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+
+class ChainTransfer(models.Model):
+    """Observed TRC-20 event, persisted before confirmation or crediting."""
+
+    class Status(models.TextChoices):
+        DETECTED = "detected", "Detected"
+        CONFIRMED = "confirmed", "Confirmed"
+        CREDITED = "credited", "Credited"
+        MANUAL_REVIEW = "manual_review", "Manual review"
+
+    network = models.ForeignKey(Network, on_delete=models.PROTECT, related_name="chain_transfers")
+    txid = models.CharField(max_length=128)
+    event_index = models.PositiveIntegerField()
+    block_number = models.PositiveBigIntegerField()
+    block_hash = models.CharField(max_length=128, blank=True, default="")
+    contract_address = models.CharField(max_length=128)
+    sender_address = models.CharField(max_length=64, blank=True, default="")
+    recipient_address = models.CharField(max_length=64)
+    amount_base_units = models.DecimalField(max_digits=78, decimal_places=0)
+    amount = models.DecimalField(max_digits=38, decimal_places=18)
+    confirmations = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DETECTED)
+    review_reason = models.CharField(max_length=255, blank=True, default="")
+    raw_event = models.JSONField(default=dict, blank=True)
+    deposit = models.ForeignKey(Deposit, null=True, blank=True, on_delete=models.PROTECT, related_name="chain_transfers")
+    attribution_reason = models.CharField(max_length=255, blank=True, default="")
+    credited_at = models.DateTimeField(null=True, blank=True)
+    observed_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["network", "txid", "event_index"], name="uniq_chain_transfer_event"),
+            models.UniqueConstraint(
+                fields=["deposit"],
+                condition=models.Q(deposit__isnull=False),
+                name="uniq_chain_transfer_deposit",
+            ),
+            models.CheckConstraint(condition=models.Q(amount_base_units__gt=0), name="chain_transfer_positive_amount"),
+            models.CheckConstraint(condition=models.Q(block_number__gt=0), name="chain_transfer_positive_block"),
+        ]
+        indexes = [models.Index(fields=["status", "block_number"]), models.Index(fields=["recipient_address"])]
+
+
 class BankDeposit(models.Model):
-    """Bank-transfer specific details for a deposit."""
+    """Bank-transfer specific details for a deposit.
+
+    The client never receives automated account details. An administrator
+    provides them outside the application and records the independent
+    verification evidence here before any approval.
+    """
 
     deposit = models.OneToOneField(Deposit, on_delete=models.CASCADE, related_name="bank")
     provider_account = models.CharField(max_length=64, blank=True, default="")
     provider_reference = models.CharField(max_length=64, blank=True, default="")
     sender_name = models.CharField(max_length=160, blank=True, default="")
     sender_bank = models.CharField(max_length=120, blank=True, default="")
+    verified_amount = models.DecimalField(
+        max_digits=MONEY_DIGITS[0], decimal_places=MONEY_DIGITS[1], null=True, blank=True
+    )
+    verified_currency = models.CharField(max_length=16, blank=True, default="")
+    verified_reference = models.CharField(max_length=128, blank=True, default="")
+    verification_source = models.CharField(max_length=255, blank=True, default="")
+    decision_reason = models.TextField(blank=True, default="")
+    approved_by = models.ForeignKey(
+        User, on_delete=models.PROTECT, null=True, blank=True, related_name="approved_bank_deposits"
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(
+        User, on_delete=models.PROTECT, null=True, blank=True, related_name="rejected_bank_deposits"
+    )
+    rejected_at = models.DateTimeField(null=True, blank=True)
     settled_at = models.DateTimeField(null=True, blank=True)
     reversed_at = models.DateTimeField(null=True, blank=True)
     is_card_funded = models.BooleanField(default=False)
@@ -825,6 +932,28 @@ class Job(models.Model):
         return f"Job({self.kind}, {self.dedupe_key}, {self.status})"
 
 
+class ScheduledJob(models.Model):
+    """Lease-backed lock and last-run heartbeat for operational commands."""
+
+    name = models.CharField(max_length=64, unique=True)
+    lock_owner = models.CharField(max_length=64, blank=True, default="")
+    lock_expires_at = models.DateTimeField(null=True, blank=True)
+    last_started_at = models.DateTimeField(null=True, blank=True)
+    last_success_at = models.DateTimeField(null=True, blank=True)
+    last_failure_at = models.DateTimeField(null=True, blank=True)
+    consecutive_failures = models.PositiveIntegerField(default=0)
+    last_error = models.CharField(max_length=500, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["name"]
+        indexes = [models.Index(fields=["lock_expires_at"])]
+
+    def __str__(self):
+        return f"ScheduledJob({self.name}, failures={self.consecutive_failures})"
+
+
 class ReconciliationRun(models.Model):
     """Evidence that a provider and the ledger agreed (or did not)."""
 
@@ -853,3 +982,45 @@ class ReconciliationRun(models.Model):
 
     def __str__(self):
         return f"ReconciliationRun({self.rail}, {self.status}, {self.difference})"
+
+
+class ReconciliationDiscrepancy(models.Model):
+    """An actionable reconciliation finding. Never auto-corrects money."""
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        RESOLVED = "resolved", "Resolved"
+        IGNORED = "ignored", "Ignored"
+
+    run = models.ForeignKey(
+        ReconciliationRun, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="discrepancies",
+    )
+    kind = models.CharField(max_length=64)
+    severity = models.CharField(max_length=16, default="warning")
+    fingerprint = models.CharField(max_length=128, unique=True)
+    deposit = models.ForeignKey(
+        Deposit, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="reconciliation_discrepancies",
+    )
+    chain_transfer = models.ForeignKey(
+        ChainTransfer, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="reconciliation_discrepancies",
+    )
+    details = models.TextField(blank=True, default="")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.OPEN)
+    resolution = models.TextField(blank=True, default="")
+    resolved_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="resolved_reconciliation_discrepancies",
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["status", "kind"])]
+
+    def __str__(self):
+        return f"ReconciliationDiscrepancy({self.kind}, {self.status})"

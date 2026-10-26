@@ -2,7 +2,24 @@ from __future__ import annotations
 
 from django.contrib import admin
 
-from .models import AuditLog, DemoAccount, Instrument, Position, SupportTicket, Transaction, User, WatchlistItem
+from .models import (
+    Asset,
+    AuditLog,
+    ChainScanCursor,
+    ChainTransfer,
+    CryptoDeposit,
+    DemoAccount,
+    Deposit,
+    DepositAddress,
+    DepositProvider,
+    Instrument,
+    Network,
+    Position,
+    SupportTicket,
+    Transaction,
+    User,
+    WatchlistItem,
+)
 
 
 class ReadOnlyFinancialRecordsAdmin(admin.ModelAdmin):
@@ -71,3 +88,62 @@ class SupportTicketAdmin(admin.ModelAdmin):
 class AuditLogAdmin(admin.ModelAdmin):
     list_display = ("action", "user", "actor", "created_at")
     search_fields = ("action", "details")
+
+
+@admin.register(Asset)
+class AssetAdmin(ReadOnlyFinancialRecordsAdmin):
+    list_display = ("code", "display_name", "decimals", "is_active")
+    search_fields = ("code", "display_name")
+    readonly_fields = tuple(field.name for field in Asset._meta.fields)
+
+
+@admin.register(DepositProvider)
+class DepositProviderAdmin(ReadOnlyFinancialRecordsAdmin):
+    list_display = ("code", "display_name", "rail", "is_active")
+    list_filter = ("rail", "is_active")
+    readonly_fields = tuple(field.name for field in DepositProvider._meta.fields)
+
+
+@admin.register(Network)
+class NetworkAdmin(ReadOnlyFinancialRecordsAdmin):
+    list_display = ("chain", "asset", "token_standard", "is_testnet", "is_active")
+    list_filter = ("chain", "is_testnet", "is_active")
+    readonly_fields = tuple(field.name for field in Network._meta.fields)
+
+
+@admin.register(Deposit)
+class DepositAdmin(ReadOnlyFinancialRecordsAdmin):
+    list_display = ("reference", "user", "asset", "expected_amount", "status", "rail", "created_at")
+    list_filter = ("status", "rail", "asset")
+    search_fields = ("reference", "user__username", "provider_ref")
+    readonly_fields = tuple(field.name for field in Deposit._meta.fields)
+
+
+@admin.register(CryptoDeposit)
+class CryptoDepositAdmin(ReadOnlyFinancialRecordsAdmin):
+    list_display = ("deposit", "network", "txid", "confirmations", "required_confirmations")
+    list_filter = ("network",)
+    search_fields = ("txid", "address")
+    readonly_fields = tuple(field.name for field in CryptoDeposit._meta.fields)
+
+
+@admin.register(DepositAddress)
+class DepositAddressAdmin(ReadOnlyFinancialRecordsAdmin):
+    list_display = ("address", "user", "network", "deposit", "is_active")
+    list_filter = ("network", "is_active")
+    search_fields = ("address", "provider_ref")
+    readonly_fields = tuple(field.name for field in DepositAddress._meta.fields)
+
+
+@admin.register(ChainScanCursor)
+class ChainScanCursorAdmin(ReadOnlyFinancialRecordsAdmin):
+    list_display = ("network", "timestamp", "block_number", "window_end_timestamp", "updated_at")
+    readonly_fields = tuple(field.name for field in ChainScanCursor._meta.fields)
+
+
+@admin.register(ChainTransfer)
+class ChainTransferAdmin(ReadOnlyFinancialRecordsAdmin):
+    list_display = ("txid", "event_index", "network", "recipient_address", "amount", "status", "block_number")
+    list_filter = ("status", "network")
+    search_fields = ("txid", "sender_address", "recipient_address")
+    readonly_fields = tuple(field.name for field in ChainTransfer._meta.fields)

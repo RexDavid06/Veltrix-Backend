@@ -1,8 +1,10 @@
 """Customer deposit API and NOWPayments IPN receiver."""
+import base64
 import hashlib
 import json
 import os
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
 
 from django.conf import settings
 from django.db import transaction
@@ -20,6 +22,11 @@ from veltrix_app.services.adapters import AdapterError, ProviderUnavailable, get
 from veltrix_app.services.deposits import (
     DepositError, check_amount, create_deposit_intent, credit_deposit,
     reverse_deposit, send_to_manual_review, transition, validate_nowpayments_quote, verify_deposit,
+)
+from veltrix_app.services.tron import (
+    TronConfigurationError,
+    public_tron_configuration,
+    record_txid_submission,
 )
 
 
@@ -45,17 +52,53 @@ def _amount_text(value, places=None):
     return text if places is not None else (text.rstrip("0").rstrip(".") if "." in text else text)
 
 
+def _qr_data_uri(value):
+    if not value:
+        return None
+    try:
+        import qrcode
+        import qrcode.image.svg
+    except ImportError:
+        return None
+    image = qrcode.make(value, image_factory=qrcode.image.svg.SvgPathImage, box_size=10, border=4)
+    buffer = BytesIO()
+    image.save(buffer)
+    return "data:image/svg+xml;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _txid_state(deposit, crypto):
+    if not crypto:
+        return ""
+    transfer = deposit.chain_transfers.order_by("-pk").first()
+    if transfer:
+        return transfer.status
+    if crypto.submitted_txid:
+        return "submitted_pending_verification"
+    return ""
+
+
 def public_deposit(deposit):
     crypto = getattr(deposit, "crypto", None)
+    bank = getattr(deposit, "bank", None)
     instructions = dict(deposit.instructions or {})
     # The client first reviews the USD and USDT quote, then explicitly confirms
     # before the API returns the provider address.
     if deposit.price_amount is not None and not deposit.quote_confirmed_at:
         instructions.pop("address", None)
+    address = instructions.get("address")
     return {
         "id": deposit.pk, "reference": deposit.reference, "asset": deposit.asset.code,
-        "network": crypto.network.chain if crypto else deposit.quoted_network or None,
+        "rail": deposit.rail,
+        "provider": deposit.provider.code,
+        "network": (f"{crypto.network.chain} ({crypto.network.token_standard})" if crypto else deposit.quoted_network or None),
+        "minimum_deposit": (_amount_text(crypto.network.min_deposit) if crypto and crypto.network.min_deposit > 0 else None),
+        "confirmations": crypto.confirmations if crypto else 0,
+        "required_confirmations": crypto.required_confirmations if crypto else None,
+        "qr_code": _qr_data_uri(address),
         "expected_amount": None if deposit.provider_creation_uncertain else _amount_text(deposit.expected_amount),
+        "requested_amount": _amount_text(crypto.requested_amount) if crypto and crypto.requested_amount is not None else _amount_text(deposit.expected_amount),
+        "payable_amount": _amount_text(crypto.payable_amount) if crypto and crypto.payable_amount is not None else _amount_text(deposit.expected_amount),
+        "expires_at": crypto.expires_at if crypto else None,
         "provider_creation_uncertain": deposit.provider_creation_uncertain,
         "price_amount": _amount_text(deposit.price_amount, 2),
         "price_currency": deposit.price_currency.upper() or None,
@@ -71,7 +114,12 @@ def public_deposit(deposit):
         "quote_confirmed": bool(deposit.quote_confirmed_at),
         "received_amount": _amount_text(deposit.received_amount),
         "status": deposit.status, "instructions": instructions,
-        "transaction_hash": crypto.txid if crypto else "", "created_at": deposit.created_at,
+        "transaction_hash": crypto.txid if crypto else "",
+        "submitted_txid": crypto.submitted_txid if crypto else "",
+        "txid_state": _txid_state(deposit, crypto),
+        "bank_verified": bool(bank and bank.verified_amount is not None) if bank else False,
+        "verified_amount": _amount_text(bank.verified_amount) if bank and bank.verified_amount is not None else None,
+        "created_at": deposit.created_at,
         "updated_at": deposit.updated_at,
     }
 
@@ -89,26 +137,41 @@ class DepositListCreateAPIView(APIView):
         return [UserRateThrottle()]
 
     def get(self, request):
-        qs = Deposit.objects.filter(user=request.user, rail=Deposit.Rail.CRYPTO, provider__code="nowpayments").select_related("asset", "crypto__network")
+        qs = Deposit.objects.filter(
+            user=request.user,
+            rail__in=[Deposit.Rail.CRYPTO, Deposit.Rail.BANK],
+        ).select_related("asset", "provider", "crypto__network", "bank")
         return Response([public_deposit(d) for d in qs[:100]])
 
     def post(self, request):
-        if not getattr(settings, "FUNDING_DEPOSITS_ENABLED", False) or not getattr(settings, "NOWPAYMENTS_ENABLED", False):
+        direct = getattr(settings, "CRYPTO_DEPOSIT_MODE", "direct_tron") == "direct_tron"
+        enabled = getattr(settings, "TRON_DEPOSITS_ENABLED", False) if direct else getattr(settings, "NOWPAYMENTS_ENABLED", False)
+        if not getattr(settings, "FUNDING_DEPOSITS_ENABLED", False) or not enabled:
             return Response({"detail": "USDT deposits are not enabled on this deployment."}, status=503)
-        amount_text = request.data.get("amount_usd")
+        amount_text = request.data.get("amount" if direct else "amount_usd")
         try:
             amount = Decimal(str(amount_text))
+            precision = 6 if direct else 2
             if (not amount.is_finite() or amount <= 0
-                    or amount.quantize(Decimal("0.01")) != amount):
+                    or amount.quantize(Decimal(1).scaleb(-precision)) != amount):
                 raise InvalidOperation
         except (InvalidOperation, TypeError, ValueError):
-            return Response({"detail": "Enter a valid positive USD amount (up to 2 decimal places)."}, status=400)
+            return Response({"detail": "Enter a valid positive USDT amount (up to 6 decimal places)." if direct else "Enter a valid positive USD amount (up to 2 decimal places)."}, status=400)
         idempotency_key = request.headers.get("Idempotency-Key") or request.data.get("idempotency_key")
         if not idempotency_key or len(str(idempotency_key)) > 64:
             return Response({"detail": "A valid Idempotency-Key header is required."}, status=400)
-        provider = get_object_or_404(DepositProvider, code="nowpayments", rail=DepositProvider.Rail.CRYPTO, is_active=True)
+        provider_code = "direct_tron" if direct else "nowpayments"
+        provider = get_object_or_404(DepositProvider, code=provider_code, rail=DepositProvider.Rail.CRYPTO, is_active=True)
         asset = get_object_or_404(Asset, code="USDT", is_active=True)
-        network = get_object_or_404(Network, asset=asset, chain__iexact="TRON", token_standard__iexact="TRC20", is_active=True, is_testnet=False)
+        if direct:
+            try:
+                from veltrix_app.services.tron import get_configured_network
+                network = get_configured_network()
+            except TronConfigurationError as exc:
+                return Response({"detail": str(exc)}, status=503)
+        else:
+            network = get_object_or_404(Network, asset=asset, chain__iexact="TRON", token_standard__iexact="TRC20", is_active=True,
+                is_testnet=False)
         try:
             deposit = create_deposit_intent(request.user, provider, asset, amount,
                 idempotency_key=str(idempotency_key), network=network)
@@ -123,9 +186,157 @@ class DepositDetailAPIView(APIView):
     permission_classes = (permissions.IsAuthenticated, IsClientAccount)
 
     def get(self, request, pk):
-        deposit = get_object_or_404(Deposit.objects.select_related("asset", "crypto__network"),
-            pk=pk, user=request.user, rail=Deposit.Rail.CRYPTO, provider__code="nowpayments")
+        deposit = get_object_or_404(
+            Deposit.objects.select_related("asset", "provider", "crypto__network", "bank"),
+            pk=pk, user=request.user,
+            rail__in=[Deposit.Rail.CRYPTO, Deposit.Rail.BANK],
+        )
         return Response(public_deposit(deposit))
+
+
+class DepositConfigAPIView(APIView):
+    """Non-secret funding configuration for the client deposit screen."""
+
+    permission_classes = (permissions.IsAuthenticated, IsClientAccount)
+
+    def get(self, request):
+        deposits_enabled = bool(getattr(settings, "FUNDING_DEPOSITS_ENABLED", False))
+        crypto_mode = getattr(settings, "CRYPTO_DEPOSIT_MODE", "direct_tron")
+        bank_enabled = bool(
+            getattr(settings, "BANK_TRANSFERS_ENABLED", False)
+            and deposits_enabled
+        )
+        result = {
+            "deposits_enabled": deposits_enabled,
+            "crypto_mode": crypto_mode,
+            "methods": [
+                {
+                    "type": "card",
+                    "enabled": False,
+                    "label": "Card payment",
+                    "note": "Card payments coming soon.",
+                },
+                {
+                    "type": "bank_transfer",
+                    "enabled": bank_enabled,
+                    "label": "Direct bank transfer",
+                    "currency": getattr(settings, "BANK_TRANSFER_CURRENCY", "") or "",
+                    "instructions": (
+                        "To make a direct bank transfer, please reach out to the admin/support "
+                        "team to get the verified bank account details. "
+                        "Never send funds to details from unverified sources."
+                    ),
+                },
+                {
+                    "type": "crypto",
+                    "enabled": False,
+                    "label": "Crypto payment (USDT TRC20)",
+                    "currency": "USDT",
+                    "network": "TRON (TRC20)",
+                },
+            ],
+            "bank": {
+                "enabled": bank_enabled,
+                "currency": getattr(settings, "BANK_TRANSFER_CURRENCY", "") or "",
+                "instructions": (
+                    "Contact the admin/support team to request verified bank-transfer "
+                    "details. Never send funds to details from another source."
+                ),
+            },
+        }
+        if crypto_mode == "direct_tron":
+            crypto_active = bool(
+                deposits_enabled and getattr(settings, "TRON_DEPOSITS_ENABLED", False)
+            )
+            try:
+                tron_cfg = public_tron_configuration()
+            except TronConfigurationError as exc:
+                result["tron"] = {"enabled": False, "error": str(exc)}
+            else:
+                if not crypto_active:
+                    # Do not expose a wallet address while funding is disabled.
+                    result["tron"] = {
+                        "enabled": False,
+                        "error": "Direct TRON deposits are disabled on this deployment.",
+                    }
+                else:
+                    result["tron"] = tron_cfg
+                    for method in result["methods"]:
+                        if method.get("type") == "crypto":
+                            method["enabled"] = bool(tron_cfg.get("enabled") and tron_cfg.get("address"))
+                            method["address"] = tron_cfg.get("address") or ""
+                            method["contract"] = tron_cfg.get("contract_address") or ""
+                            method["instructions"] = (
+                                "Copy the USDT TRC20 wallet address below and send your USDT from your wallet. "
+                                "Only send USDT on the TRON (TRC20) network."
+                            )
+                            break
+        else:
+            result["tron"] = {"enabled": False, "error": "Direct TRON deposits are not active."}
+        return Response(result)
+
+
+class DepositTxidAPIView(APIView):
+    """Record a client transaction-hash claim; never credit on this call."""
+
+    permission_classes = (permissions.IsAuthenticated, IsClientAccount)
+    throttle_classes = (ScopedRateThrottle,)
+    throttle_scope = "deposit_txid"
+
+    def post(self, request, pk):
+        deposit = get_object_or_404(
+            Deposit.objects.select_related("asset", "provider", "crypto__network"),
+            pk=pk, user=request.user,
+            rail=Deposit.Rail.CRYPTO, provider__code="direct_tron",
+        )
+        try:
+            outcome = record_txid_submission(
+                deposit, request.data.get("txid"), actor=request.user
+            )
+        except DepositError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        deposit.refresh_from_db()
+        return Response({"deposit": public_deposit(deposit), **outcome}, status=202)
+
+
+class BankDepositCreateAPIView(APIView):
+    """Create a manual bank-transfer request with no automated account details."""
+
+    permission_classes = (permissions.IsAuthenticated, IsClientAccount)
+    throttle_classes = (ScopedRateThrottle,)
+    throttle_scope = "deposit_create"
+
+    def post(self, request):
+        if not getattr(settings, "FUNDING_DEPOSITS_ENABLED", False):
+            return Response({"detail": "Deposits are not enabled on this deployment."}, status=503)
+        if not getattr(settings, "BANK_TRANSFERS_ENABLED", False):
+            return Response({"detail": "Bank transfers are not enabled on this deployment."}, status=503)
+        currency = str(getattr(settings, "BANK_TRANSFER_CURRENCY", "") or "").upper()
+        if not currency:
+            return Response({"detail": "Bank transfers are unavailable until a currency is configured."}, status=503)
+        try:
+            amount = Decimal(str(request.data.get("amount")))
+            if not amount.is_finite() or amount <= 0:
+                raise InvalidOperation
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({"detail": "Enter a valid positive amount."}, status=400)
+        idempotency_key = request.headers.get("Idempotency-Key") or request.data.get("idempotency_key")
+        if not idempotency_key or len(str(idempotency_key)) > 64:
+            return Response({"detail": "A valid Idempotency-Key header is required."}, status=400)
+        provider = DepositProvider.objects.filter(
+            code="bank_manual", rail=DepositProvider.Rail.BANK, is_active=True
+        ).first()
+        asset = Asset.objects.filter(code=currency, is_active=True).first()
+        if provider is None or asset is None:
+            return Response({"detail": "Bank transfers are not configured for this currency."}, status=503)
+        try:
+            deposit = create_deposit_intent(
+                request.user, provider, asset, amount,
+                idempotency_key=str(idempotency_key),
+            )
+        except DepositError as exc:
+            return Response({"detail": str(exc)}, status=400)
+        return Response(public_deposit(deposit), status=201)
 
 
 class DepositQuoteConfirmAPIView(APIView):

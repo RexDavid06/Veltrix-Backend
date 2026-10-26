@@ -40,10 +40,21 @@ documented list (`SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS`, `DATABASE_URL`,
 `MARKET_USE_LIVE`, `LOG_LEVEL`, ...). In production, provide these through your
 host's environment / secrets manager instead of shipping a `.env` file.
 
+## Funding rails
+
+- NOWPayments and direct USDT TRC-20 funding code exists but is disabled by
+  default and fail-closed.
+- Direct TRON uses one shared public receiving address. The application never
+  handles private keys and does not sweep funds.
+- Manual bank deposits are recorded and reviewed by an administrator; account
+  details are deliberately provided outside the app.
+- See `docs/direct-usdt-tron.md` for configuration, monitoring, reconciliation,
+  testnet rehearsal, and controlled mainnet activation.
+
 ## What is still simulated
-- No real fund movement
+- Demo-account top-ups are separate from real funding and should stay disabled
+  in production.
 - No real broker/exchange execution
-- No payment provider or custody integration
 - Prices are still illustrative until a real data feed is configured
 
 ## Next recommended step

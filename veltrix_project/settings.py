@@ -7,12 +7,52 @@ import environ
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Load variables from a local, git-ignored .env file (real values come from the
 # process environment in production). read_env never overwrites real env vars.
 environ.Env.read_env(BASE_DIR / ".env")
+
+
+def _non_negative_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ImproperlyConfigured(f"{name} must be a non-negative integer") from exc
+    if value < 0:
+        raise ImproperlyConfigured(f"{name} must be a non-negative integer")
+    return value
+
+
+def _non_negative_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise ImproperlyConfigured(f"{name} must be a non-negative number") from exc
+    if value < 0:
+        raise ImproperlyConfigured(f"{name} must be a non-negative number")
+    return value
+
+
+def _optional_decimal(name: str) -> str:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return ""
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError) as exc:
+        raise ImproperlyConfigured(f"{name} must be a non-negative decimal") from exc
+    if not value.is_finite() or value < 0:
+        raise ImproperlyConfigured(f"{name} must be a non-negative decimal")
+    return raw
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-me")
 _raw_debug = os.environ.get("DEBUG")
@@ -214,6 +254,71 @@ if FUNDING_DEMO_TOPUP_ENABLED and _funding_is_production_deployment:
 # network, webhook and settlement verification. Never infer enablement from DEBUG.
 FUNDING_DEPOSITS_ENABLED = os.environ.get("FUNDING_DEPOSITS_ENABLED", "0") == "1"
 NOWPAYMENTS_ENABLED = os.environ.get("NOWPAYMENTS_ENABLED", "0") == "1"
+# Direct TRON deposits are a separate, opt-in rail. Only a public, business
+# controlled receiving address is configured here: this application never
+# receives, derives, stores or signs with private key material.
+CRYPTO_DEPOSIT_MODE = os.environ.get("CRYPTO_DEPOSIT_MODE", "direct_tron").strip().lower()
+if CRYPTO_DEPOSIT_MODE not in ("nowpayments", "direct_tron"):
+    raise ImproperlyConfigured("CRYPTO_DEPOSIT_MODE must be nowpayments or direct_tron")
+TRON_DEPOSITS_ENABLED = os.environ.get("TRON_DEPOSITS_ENABLED", "0") == "1"
+TRON_NETWORK = os.environ.get("TRON_NETWORK", "").strip().lower()
+TRON_API_BASE_URL = os.environ.get("TRON_API_BASE_URL", "").strip().rstrip("/")
+TRON_API_KEY = os.environ.get("TRON_API_KEY", "").strip()
+# One shared receiving wallet for every client. Never invent or default this.
+TRON_USDT_RECEIVING_ADDRESS = (
+    os.environ.get("VELTRIX_USDT_TRC20_RECEIVING_ADDRESS", "").strip()
+    or os.environ.get("TRON_USDT_RECEIVING_ADDRESS", "").strip()
+)
+# Optional override. On mainnet an empty value resolves to the pinned official
+# Tether TRC-20 contract; a supplied value must match it exactly.
+TRON_USDT_CONTRACT = os.environ.get("TRON_USDT_CONTRACT", "").strip()
+TRON_REQUIRED_CONFIRMATIONS = _non_negative_int("TRON_REQUIRED_CONFIRMATIONS", 0)
+TRON_LIVE_VERIFIED = os.environ.get("TRON_LIVE_VERIFIED", "0") == "1"
+# Timestamp-based event scanning. TronGrid only supports min/max timestamp
+# windows plus a fingerprint that must be replayed with identical parameters.
+TRON_SCAN_START_TIMESTAMP = _non_negative_int("TRON_SCAN_START_TIMESTAMP", 0)
+TRON_SCAN_WINDOW_SECONDS = _non_negative_int("TRON_SCAN_WINDOW_SECONDS", 3600)
+TRON_SCAN_OVERLAP_SECONDS = _non_negative_int("TRON_SCAN_OVERLAP_SECONDS", 120)
+TRON_SCAN_LAG_SECONDS = _non_negative_int("TRON_SCAN_LAG_SECONDS", 60)
+TRON_HTTP_RETRIES = _non_negative_int("TRON_HTTP_RETRIES", 3)
+TRON_HTTP_BACKOFF_SECONDS = _non_negative_float("TRON_HTTP_BACKOFF_SECONDS", 0.5)
+# Operational job leases and alert thresholds. A crashed job releases its lock
+# when the lease expires; heartbeats make a stopped scheduler visible.
+TRON_JOB_LOCK_SECONDS = _non_negative_int("TRON_JOB_LOCK_SECONDS", 900)
+TRON_MONITOR_STALE_SECONDS = _non_negative_int("TRON_MONITOR_STALE_SECONDS", 900)
+TRON_RECONCILE_STALE_SECONDS = _non_negative_int("TRON_RECONCILE_STALE_SECONDS", 93600)
+TRON_UNALLOCATED_ALERT_MINUTES = _non_negative_int("TRON_UNALLOCATED_ALERT_MINUTES", 60)
+TRON_FAILURE_ALERT_THRESHOLD = _non_negative_int("TRON_FAILURE_ALERT_THRESHOLD", 3)
+# A detected transfer that never reaches the confirmation threshold is moved
+# to manual review after this many minutes. It is never credited automatically.
+TRON_UNCONFIRMED_REVIEW_MINUTES = _non_negative_int("TRON_UNCONFIRMED_REVIEW_MINUTES", 1440)
+if TRON_SCAN_WINDOW_SECONDS < 1:
+    raise ImproperlyConfigured("TRON_SCAN_WINDOW_SECONDS must be at least 1")
+if TRON_HTTP_RETRIES > 10:
+    raise ImproperlyConfigured("TRON_HTTP_RETRIES must not exceed 10")
+if TRON_JOB_LOCK_SECONDS < 60:
+    raise ImproperlyConfigured("TRON_JOB_LOCK_SECONDS must be at least 60")
+if TRON_MONITOR_STALE_SECONDS < 1:
+    raise ImproperlyConfigured("TRON_MONITOR_STALE_SECONDS must be at least 1")
+if TRON_RECONCILE_STALE_SECONDS < 1:
+    raise ImproperlyConfigured("TRON_RECONCILE_STALE_SECONDS must be at least 1")
+if TRON_FAILURE_ALERT_THRESHOLD < 1:
+    raise ImproperlyConfigured("TRON_FAILURE_ALERT_THRESHOLD must be at least 1")
+# Shared-address attribution is conservative. Unique payable amounts are an
+# optional matching aid, not proof of ownership, and automatic crediting is a
+# separate opt-in from automatic matching.
+TRON_UNIQUE_AMOUNT_ENABLED = os.environ.get("TRON_UNIQUE_AMOUNT_ENABLED", "0") == "1"
+TRON_AUTO_MATCH_UNIQUE_AMOUNT = os.environ.get("TRON_AUTO_MATCH_UNIQUE_AMOUNT", "0") == "1"
+TRON_AUTO_CREDIT_UNIQUE_AMOUNT = os.environ.get("TRON_AUTO_CREDIT_UNIQUE_AMOUNT", "0") == "1"
+TRON_REQUEST_TTL_MINUTES = _non_negative_int("TRON_REQUEST_TTL_MINUTES", 0)
+TRON_MIN_DEPOSIT = _optional_decimal("TRON_MIN_DEPOSIT")
+TRON_MAX_DEPOSIT = _optional_decimal("TRON_MAX_DEPOSIT")
+if TRON_MIN_DEPOSIT and TRON_MAX_DEPOSIT and Decimal(TRON_MIN_DEPOSIT) > Decimal(TRON_MAX_DEPOSIT):
+    raise ImproperlyConfigured("TRON_MIN_DEPOSIT must not exceed TRON_MAX_DEPOSIT")
+# Manual bank transfers are a separate rail. The currency must be explicitly
+# configured; account details are provided by an administrator outside the app.
+BANK_TRANSFERS_ENABLED = os.environ.get("BANK_TRANSFERS_ENABLED", "0") == "1"
+BANK_TRANSFER_CURRENCY = os.environ.get("BANK_TRANSFER_CURRENCY", "").strip().upper()
 FUNDING_REQUIRE_KYC = os.environ.get("FUNDING_REQUIRE_KYC", "1") == "1"
 NOWPAYMENTS_SANDBOX = os.environ.get("NOWPAYMENTS_SANDBOX", "0") == "1"
 # Hard code this off until the submitted amount's USD pricing, USDT outcome,
@@ -225,6 +330,9 @@ NOWPAYMENTS_LIVE_AMOUNT_MODEL_APPROVED = False
 # available in non-production environments without this production switch.
 FUNDING_LIVE_VERIFIED = os.environ.get("FUNDING_LIVE_VERIFIED", "0") == "1"
 _funding_is_production = (not DEBUG) or bool(DATABASE_URL)
+# Expose this to safety checks that must distinguish a local testnet rehearsal
+# from a deployed production service. Testnet is never a production rail.
+FUNDING_DEPLOYMENT_IS_PRODUCTION = _funding_is_production
 _live_funding_requested = not NOWPAYMENTS_SANDBOX
 _live_funding_approved = _DEBUG_CONFIGURED and not DEBUG and FUNDING_LIVE_VERIFIED
 if ((_funding_is_production or _live_funding_requested) and not _live_funding_approved):
@@ -272,6 +380,7 @@ REST_FRAMEWORK = {
         "anon": "20/min",
         "user": "1000/day",
         "deposit_create": "5/hour",
+        "deposit_txid": "20/hour",
         "provider_webhook": "120/min",
     },
 }
