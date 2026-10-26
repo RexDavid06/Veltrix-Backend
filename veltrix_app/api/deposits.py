@@ -245,34 +245,67 @@ class DepositConfigAPIView(APIView):
             },
         }
         if crypto_mode == "direct_tron":
-            crypto_active = bool(
-                deposits_enabled and getattr(settings, "TRON_DEPOSITS_ENABLED", False)
-            )
+            tron_option_enabled = bool(getattr(settings, "TRON_DEPOSITS_ENABLED", False))
+            requests_enabled = bool(deposits_enabled and tron_option_enabled)
             try:
                 tron_cfg = public_tron_configuration()
             except TronConfigurationError as exc:
-                result["tron"] = {"enabled": False, "error": str(exc)}
+                result["tron"] = {
+                    "configured": False,
+                    "display_enabled": False,
+                    "enabled": False,
+                    "requests_enabled": False,
+                    "live_enabled": False,
+                    "error": str(exc),
+                }
             else:
-                if not crypto_active:
-                    # Do not expose a wallet address while funding is disabled.
+                if requests_enabled:
                     result["tron"] = {
-                        "enabled": False,
-                        "error": "Direct TRON deposits are disabled on this deployment.",
+                        **tron_cfg,
+                        "configured": True,
+                        "display_enabled": True,
+                        "requests_enabled": True,
                     }
                 else:
-                    result["tron"] = tron_cfg
-                    for method in result["methods"]:
-                        if method.get("type") == "crypto":
-                            method["enabled"] = bool(tron_cfg.get("enabled") and tron_cfg.get("address"))
+                    result["tron"] = {
+                        "configured": True,
+                        "display_enabled": tron_option_enabled,
+                        "enabled": False,
+                        "requests_enabled": False,
+                        "live_enabled": False,
+                        "network": tron_cfg.get("network"),
+                        "token_standard": tron_cfg.get("token_standard"),
+                        "asset": tron_cfg.get("asset"),
+                        "decimals": tron_cfg.get("decimals"),
+                        "is_testnet": tron_cfg.get("is_testnet"),
+                        "error": (
+                            "Direct TRON deposits are configured, but new deposit requests are not open on this deployment."
+                            if tron_option_enabled
+                            else "Direct TRON deposits are not enabled on this deployment."
+                        ),
+                    }
+                for method in result["methods"]:
+                    if method.get("type") == "crypto":
+                        method["configured"] = True
+                        method["display_enabled"] = tron_option_enabled
+                        method["enabled"] = requests_enabled
+                        if requests_enabled:
                             method["address"] = tron_cfg.get("address") or ""
                             method["contract"] = tron_cfg.get("contract_address") or ""
                             method["instructions"] = (
                                 "Copy the USDT TRC20 wallet address below and send your USDT from your wallet. "
                                 "Only send USDT on the TRON (TRC20) network."
                             )
-                            break
+                        break
         else:
-            result["tron"] = {"enabled": False, "error": "Direct TRON deposits are not active."}
+            result["tron"] = {
+                "configured": False,
+                "display_enabled": False,
+                "enabled": False,
+                "requests_enabled": False,
+                "live_enabled": False,
+                "error": "Direct TRON deposits are not active.",
+            }
         return Response(result)
 
 

@@ -46,6 +46,14 @@ environment, settings additionally require an explicit `DEBUG=0` and
 off. This is a deployment safety gate, not a substitute for provider
 verification.
 
+A valid direct-TRON configuration can still be reported for display while that
+global switch is off. In that state `/api/deposits/config/` exposes
+`tron.configured` and `tron.display_enabled`, but `tron.enabled`,
+`tron.requests_enabled`, and `tron.live_enabled` remain false, no receiving
+address is returned, and deposit creation is rejected. The client may show the
+USDT option as "configured, requests not open" but must not ask the client to
+send funds.
+
 The direct rail requires all of the following:
 
 - `CRYPTO_DEPOSIT_MODE=direct_tron`

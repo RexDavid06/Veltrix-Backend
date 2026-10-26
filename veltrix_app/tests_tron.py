@@ -802,6 +802,58 @@ class TronAPITests(TronBaseTests):
         self.assertFalse(crypto["enabled"])
         self.assertNotIn("address", crypto)
 
+    @override_settings(**{
+        **BASE_SETTINGS,
+        "FUNDING_DEPOSITS_ENABLED": False,
+        "TRON_DEPOSITS_ENABLED": True,
+        "TRON_LIVE_VERIFIED": False,
+    })
+    def test_config_displays_configured_tron_option_without_address_or_creation(self):
+        config = self.client.get("/api/deposits/config/")
+        self.assertEqual(config.status_code, 200)
+        self.assertFalse(config.data["deposits_enabled"])
+        self.assertTrue(config.data["tron"]["configured"])
+        self.assertTrue(config.data["tron"]["display_enabled"])
+        self.assertFalse(config.data["tron"]["enabled"])
+        self.assertFalse(config.data["tron"]["requests_enabled"])
+        self.assertFalse(config.data["tron"]["live_enabled"])
+        self.assertNotIn("address", config.data["tron"])
+        self.assertNotIn("contract_address", config.data["tron"])
+        self.assertIn("configured", config.data["tron"]["error"].lower())
+        crypto = next(item for item in config.data["methods"] if item["type"] == "crypto")
+        self.assertTrue(crypto["configured"])
+        self.assertTrue(crypto["display_enabled"])
+        self.assertFalse(crypto["enabled"])
+        self.assertNotIn("address", crypto)
+        self.assertNotIn("contract", crypto)
+        self.assertNotIn(RECEIVING, str(config.data))
+
+        response = self.client.post(
+            "/api/deposits/", {"amount": "1.234567"}, format="json",
+            HTTP_IDEMPOTENCY_KEY="display-only-create",
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(Deposit.objects.filter(user=self.user).count(), 0)
+
+    @override_settings(**{
+        **BASE_SETTINGS,
+        "FUNDING_DEPOSITS_ENABLED": False,
+        "TRON_DEPOSITS_ENABLED": True,
+        "TRON_NETWORK": "",
+    })
+    def test_invalid_tron_configuration_is_not_displayed_or_exposed(self):
+        config = self.client.get("/api/deposits/config/")
+        self.assertEqual(config.status_code, 200)
+        self.assertFalse(config.data["tron"]["configured"])
+        self.assertFalse(config.data["tron"]["display_enabled"])
+        self.assertFalse(config.data["tron"]["enabled"])
+        self.assertFalse(config.data["tron"]["requests_enabled"])
+        self.assertNotIn("address", config.data["tron"])
+        self.assertIn("TRON_NETWORK", config.data["tron"]["error"])
+        crypto = next(item for item in config.data["methods"] if item["type"] == "crypto")
+        self.assertFalse(crypto["enabled"])
+        self.assertNotIn("address", crypto)
+
     def test_direct_mode_never_selects_nowpayments_provider(self):
         DepositProvider.objects.create(
             code="nowpayments", display_name="NOWPayments",
