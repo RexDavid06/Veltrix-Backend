@@ -892,6 +892,11 @@ def credit_confirmed_transfer(
                 f"amount={transfer.amount} reason={reason[:500]}"
             ),
         )
+    else:
+        try:
+            _send_admin_deposit_email(transfer, deposit)
+        except Exception:
+            pass
     return transfer
 
 
@@ -980,6 +985,51 @@ def assign_transfer(transfer_id: int, deposit_id: int, *, actor, reason: str):
             )
         transfer.refresh_from_db()
         return transfer
+
+
+def _send_admin_deposit_email(transfer: ChainTransfer, deposit: Deposit) -> None:
+    try:
+        from django.conf import settings
+        from django.core.mail import send_mail
+        from django.db import models as djmodels
+        from veltrix_app.models import User
+
+        admin_emails = []
+        support_emails = getattr(settings, "SUPPORT_ADMIN_EMAILS", []) or []
+        if support_emails:
+            admin_emails = list(support_emails)
+        else:
+            admin_emails = list(
+                User.objects.filter(is_active=True)
+                .filter(djmodels.Q(is_staff=True) | djmodels.Q(role=User.Role.ADMIN))
+                .exclude(email="")
+                .values_list("email", flat=True)
+            )
+        if not admin_emails:
+            return
+        user = deposit.user
+        network_str = ""
+        try:
+            if getattr(deposit, "crypto", None) and getattr(deposit.crypto, "network", None):
+                network_str = f"{deposit.crypto.network.chain} ({getattr(deposit.crypto.network, 'token_standard', '')})"
+        except Exception:
+            network_str = ""
+        subject = f"Veltrix deposit credited {deposit.reference}"
+        body = (
+            f"Deposit credited automatically\n\n"
+            f"Client: {getattr(user, 'email', None) or getattr(user, 'username', '')} (ID: {getattr(user, 'id', '')})\n"
+            f"Deposit ID: {deposit.id}\n"
+            f"Reference: {deposit.reference}\n"
+            f"Asset: {getattr(deposit.asset, 'code', 'USDT')}\n"
+            f"Network: {network_str or 'TRON (TRC20)'}\n"
+            f"Amount: {transfer.amount}\n"
+            f"Transaction ID: {transfer.txid}\n"
+            f"Event index: {transfer.event_index}\n"
+            f"Block: {transfer.block_number}\n"
+        )
+        send_mail(subject, body, getattr(settings, "DEFAULT_FROM_EMAIL", None) or "noreply@veltrix.com", list(set(admin_emails)), fail_silently=True)
+    except Exception:
+        pass
 
 
 def record_txid_submission(deposit: Deposit, txid: str, *, actor=None) -> dict:

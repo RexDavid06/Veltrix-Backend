@@ -11,12 +11,14 @@ from veltrix_app.models import (
     AuditLog,
     BankDeposit,
     CardDeposit,
+    Conversation,
     CryptoDeposit,
     Deposit,
     DepositProvider,
     Job,
     KycProfile,
     LedgerEntry,
+    Message,
     Network,
 )
 from veltrix_app.services import ledger
@@ -98,6 +100,42 @@ class FundingModelMigrationTests(TestCase):
         self.assertNotEqual(first.pk, second.pk)
         self.assertEqual(first.pk, retry.pk)
         self.assertEqual(BankDeposit.objects.count(), 2)
+
+    @override_settings(FUNDING_DEPOSITS_ENABLED=True, FUNDING_REQUIRE_KYC=True)
+    def test_bank_deposit_intent_creates_admin_notification_with_identity_and_amount(self):
+        profile = ensure_profile(self.user)
+        approve_profile(profile)
+        with override_settings(FUNDING_COLLECTION_ACCOUNT={"account_number": ""}):
+            deposit = create_deposit_intent(
+                self.user, self.provider, self.asset, Decimal("25.00"), idempotency_key="intent-notify-1"
+            )
+        self.assertIsNotNone(deposit.pk)
+        conv = Conversation.objects.filter(user=self.user, is_active=True).first()
+        self.assertIsNotNone(conv)
+        messages = list(Message.objects.filter(conversation=conv).order_by("id"))
+        self.assertEqual(len(messages), 1)
+        content = messages[0].content
+        self.assertIn("deposit", content.lower())
+        self.assertIn(str(self.user.id), content)
+        self.assertIn(self.user.email, content)
+        self.assertIn(str(deposit.reference), content)
+        self.assertIn("25.00", content)
+        self.assertIn("local-bank", content)
+
+    @override_settings(FUNDING_DEPOSITS_ENABLED=True, FUNDING_REQUIRE_KYC=True)
+    def test_bank_deposit_intent_retries_do_not_duplicate_notifications(self):
+        profile = ensure_profile(self.user)
+        approve_profile(profile)
+        with override_settings(FUNDING_COLLECTION_ACCOUNT={"account_number": ""}):
+            first = create_deposit_intent(
+                self.user, self.provider, self.asset, Decimal("25.00"), idempotency_key="intent-notify-dup"
+            )
+            second = create_deposit_intent(
+                self.user, self.provider, self.asset, Decimal("25.00"), idempotency_key="intent-notify-dup"
+            )
+        self.assertEqual(first.pk, second.pk)
+        self.assertEqual(Conversation.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(Message.objects.filter(conversation__user=self.user).count(), 1)
 
     @override_settings(FUNDING_DEPOSITS_ENABLED=True, FUNDING_REQUIRE_KYC=False)
     def test_intent_creation_refreshes_frozen_state_before_accepting_request(self):

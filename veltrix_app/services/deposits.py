@@ -23,7 +23,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import timedelta
 
 from django.conf import settings
-from django.db import transaction
+from django.core.mail import send_mail
+from django.db import models, transaction
 from django.utils import timezone
 
 from veltrix_app.models import (
@@ -32,10 +33,12 @@ from veltrix_app.models import (
     AuditLog,
     BankDeposit,
     CardDeposit,
+    Conversation,
     CryptoDeposit,
     Deposit,
     DepositProvider,
     LedgerEntry,
+    Message,
     Network,
     User,
 )
@@ -312,6 +315,81 @@ def create_deposit_intent(
         action="deposit.intent_created",
         details=f"deposit={deposit.id} rail={deposit.rail} asset={deposit.asset_id} amount={amount}",
     )
+    try:
+        subject = f"Deposit request - {deposit.reference}"
+        conversation = Conversation.objects.filter(user=user, is_active=True).order_by("-updated_at").first()
+        if conversation is None:
+            conversation = Conversation.objects.create(
+                user=user,
+                subject=subject,
+            )
+        else:
+            if not conversation.subject or conversation.subject == "General Support":
+                conversation.subject = subject
+                conversation.updated_at = timezone.now()
+                conversation.save(update_fields=["subject", "updated_at"])
+            else:
+                conversation.updated_at = timezone.now()
+                conversation.save(update_fields=["updated_at"])
+        network_info = ""
+        network_str = ""
+        try:
+            if getattr(deposit, "rail", None) == Deposit.Rail.CRYPTO:
+                crypto = getattr(deposit, "crypto", None)
+                if crypto and getattr(crypto, "network", None):
+                    network_str = f"{crypto.network.chain} ({getattr(crypto.network, 'token_standard', '')})"
+                    network_info = f"Network: {network_str}\n"
+        except Exception:
+            network_info = ""
+            network_str = ""
+        message_content = (
+            f"New deposit request\n"
+            f"Client: {getattr(user, 'email', None) or user.username} (ID: {user.id})\n"
+            f"Deposit ID: {deposit.id}\n"
+            f"Reference: {deposit.reference}\n"
+            f"Rail: {deposit.rail}\n"
+            f"Provider: {deposit.provider.code}\n"
+            f"Asset: {deposit.asset.code}\n"
+            f"{network_info}"
+            f"Amount: {amount}\n"
+        )
+        if not Message.objects.filter(conversation=conversation, content=message_content).exists():
+            Message.objects.create(
+                conversation=conversation,
+                sender=user,
+                content=message_content,
+            )
+        try:
+            admin_emails = []
+            support_emails = getattr(settings, "SUPPORT_ADMIN_EMAILS", []) or []
+            if support_emails:
+                admin_emails = list(support_emails)
+            else:
+                admin_emails = list(
+                    User.objects.filter(is_active=True)
+                    .filter(models.Q(is_staff=True) | models.Q(role=User.Role.ADMIN))
+                    .exclude(email="")
+                    .values_list("email", flat=True)
+                )
+            if admin_emails:
+                email_subject = f"Veltrix deposit request {deposit.reference}"
+                email_body = (
+                    f"New deposit request\n\n"
+                    f"Client: {getattr(user, 'email', None) or user.username} (ID: {user.id})\n"
+                    f"Deposit ID: {deposit.id}\n"
+                    f"Reference: {deposit.reference}\n"
+                    f"Rail: {deposit.rail}\n"
+                    f"Provider: {deposit.provider.code}\n"
+                    f"Asset: {deposit.asset.code}\n"
+                    f"Network: {network_str or 'N/A'}\n"
+                    f"Requested amount: {amount}\n"
+                )
+                send_mail(email_subject, email_body, getattr(settings, "DEFAULT_FROM_EMAIL", None) or "noreply@veltrix.com", list(set(admin_emails)), fail_silently=True)
+        except Exception:
+            pass
+    except Exception:
+        # Never fail deposit intent creation due to notification issues
+        pass
     return deposit
 
 
