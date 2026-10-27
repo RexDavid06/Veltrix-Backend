@@ -30,7 +30,6 @@ urlpatterns = [
     path("instruments/", AdminInstrumentListView.as_view(), name="api_admin_instruments"),
     path("instruments/<int:pk>/", AdminInstrumentDetailView.as_view(), name="api_admin_instrument_detail"),
     path("audit/", AdminAuditLogListView.as_view(), name="api_admin_audit"),
-    path("deposits/", AdminDepositListView.as_view(), name="api_admin_deposits"),
     path("deposits/<int:pk>/", AdminDepositDetailView.as_view(), name="api_admin_deposit_detail"),
     path("chain-transfers/", AdminChainTransferListView.as_view(), name="api_admin_chain_transfers"),
     path("chain-transfers/<int:pk>/assign/", AdminChainTransferAssignView.as_view(), name="api_admin_chain_transfer_assign"),
