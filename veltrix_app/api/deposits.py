@@ -148,6 +148,11 @@ class DepositListCreateAPIView(APIView):
         enabled = getattr(settings, "TRON_DEPOSITS_ENABLED", False) if direct else getattr(settings, "NOWPAYMENTS_ENABLED", False)
         if not getattr(settings, "FUNDING_DEPOSITS_ENABLED", False) or not enabled:
             return Response({"detail": "USDT deposits are not enabled on this deployment."}, status=503)
+        if direct and (
+            not getattr(settings, "FUNDING_LIVE_VERIFIED", False)
+            or not getattr(settings, "TRON_LIVE_VERIFIED", False)
+        ):
+            return Response({"detail": "USDT deposits are not enabled on this deployment."}, status=503)
         amount_text = request.data.get("amount" if direct else "amount_usd")
         try:
             amount = Decimal(str(amount_text))

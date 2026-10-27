@@ -20,7 +20,7 @@ from veltrix_app.models import (
     Network,
 )
 from veltrix_app.services import ledger
-from veltrix_app.services.deposits import create_deposit_intent
+from veltrix_app.services.deposits import DepositError, create_deposit_intent
 from veltrix_app.services.tron import (
     MAINNET_USDT,
     TronConfigurationError,
@@ -134,6 +134,7 @@ BASE_SETTINGS = dict(
     TRON_REQUIRED_CONFIRMATIONS=2,
     TRON_DEPOSITS_ENABLED=True,
     TRON_LIVE_VERIFIED=True,
+    FUNDING_LIVE_VERIFIED=True,
     TRON_SCAN_START_TIMESTAMP=START_TS,
     TRON_SCAN_WINDOW_SECONDS=3600,
     TRON_SCAN_OVERLAP_SECONDS=120,
@@ -184,6 +185,23 @@ class TronBaseTests(TestCase):
     def refresh(self, router):
         with patch("veltrix_app.services.tron._request", side_effect=router):
             return refresh_confirmations(self.network)
+
+
+class TronCreationGateTests(TronBaseTests):
+    def test_direct_tron_intent_rejected_when_funding_live_not_verified(self):
+        with self.assertRaises(DepositError):
+            self.make_deposit(FUNDING_LIVE_VERIFIED=False)
+        self.assertEqual(Deposit.objects.count(), 0)
+
+    def test_direct_tron_intent_rejected_when_tron_live_not_verified(self):
+        with self.assertRaises(DepositError):
+            self.make_deposit(TRON_LIVE_VERIFIED=False)
+        self.assertEqual(Deposit.objects.count(), 0)
+
+    def test_direct_tron_intent_succeeds_when_gates_satisfied(self):
+        deposit = self.make_deposit()
+        self.assertIsNotNone(deposit.pk)
+        self.assertEqual(Deposit.objects.count(), 1)
 
 
 class TronConfigurationTests(TestCase):
@@ -714,9 +732,18 @@ class TronTestnetCreditTests(TestCase):
             is_active=True, is_test=True,
         )
         provider.supported_assets.add(asset)
-        deposit = create_deposit_intent(
-            user, provider, asset, Decimal("1.234567"),
-            idempotency_key="testnet-credit", network=network,
+        # Testnet creation is not a production path and is blocked by the
+        # mainnet live-verification gate, so build the fixture directly.
+        deposit = Deposit.objects.create(
+            user=user, rail=Deposit.Rail.CRYPTO, asset=asset, provider=provider,
+            expected_amount=Decimal("1.234567"),
+            idempotency_key="testnet-credit", reference="TEST-TESTNET",
+        )
+        CryptoDeposit.objects.create(
+            deposit=deposit, network=network, address=RECEIVING,
+            required_confirmations=network.required_confirmations,
+            requested_amount=Decimal("1.234567"),
+            payable_amount=Decimal("1.234567"),
         )
         router = TronRouter(
             event=transfer_event(contract_address=TESTNET_USDT),
@@ -875,6 +902,24 @@ class TronAPITests(TronBaseTests):
             HTTP_IDEMPOTENCY_KEY="bank-1",
         )
         self.assertEqual(response.status_code, 503)
+
+    @override_settings(**{**BASE_SETTINGS, "FUNDING_LIVE_VERIFIED": False})
+    def test_api_direct_tron_creation_rejected_when_funding_live_not_verified(self):
+        response = self.client.post(
+            "/api/deposits/", {"amount": "1.000000"}, format="json",
+            HTTP_IDEMPOTENCY_KEY="no-live-funding",
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(Deposit.objects.filter(user=self.user).count(), 0)
+
+    @override_settings(**{**BASE_SETTINGS, "TRON_LIVE_VERIFIED": False})
+    def test_api_direct_tron_creation_rejected_when_tron_live_not_verified(self):
+        response = self.client.post(
+            "/api/deposits/", {"amount": "1.000000"}, format="json",
+            HTTP_IDEMPOTENCY_KEY="no-live-tron",
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(Deposit.objects.filter(user=self.user).count(), 0)
 
     def test_txid_endpoint_does_not_credit(self):
         deposit = self.make_deposit()

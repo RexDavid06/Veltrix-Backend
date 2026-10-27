@@ -150,6 +150,15 @@ def _require_deposits_enabled() -> None:
         raise DepositError("Real deposits are not enabled on this deployment.")
 
 
+def _require_live_funding_enabled_for_direct_tron() -> None:
+    # Real direct-TRON deposits are mainnet only. Both live-verification
+    # attestations are mandatory; missing or false values fail closed.
+    if not getattr(settings, "FUNDING_LIVE_VERIFIED", False):
+        raise DepositError("Real deposits are not enabled on this deployment.")
+    if not getattr(settings, "TRON_LIVE_VERIFIED", False):
+        raise DepositError("Real deposits are not enabled on this deployment.")
+
+
 def _require_kyc(user: User) -> None:
     if not getattr(settings, "FUNDING_REQUIRE_KYC", True):
         return
@@ -225,6 +234,8 @@ def create_deposit_intent(
     # idempotency key observe the winner before calling an external provider.
     user = User.objects.select_for_update().get(pk=user.pk)
     _require_deposits_enabled()
+    if provider.code == "direct_tron":
+        _require_live_funding_enabled_for_direct_tron()
     _require_kyc(user)
     _require_not_frozen(user)
     amount = _validated_amount(amount)
