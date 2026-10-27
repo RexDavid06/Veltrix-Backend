@@ -18,11 +18,4 @@ urlpatterns = [
     path("instruments/", AdminInstrumentListView.as_view(), name="api_admin_instruments"),
     path("instruments/<int:pk>/", AdminInstrumentDetailView.as_view(), name="api_admin_instrument_detail"),
     path("audit/", AdminAuditLogListView.as_view(), name="api_admin_audit"),
-    path("chain-transfers/", AdminChainTransferListView.as_view(), name="api_admin_chain_transfers"),
-    path("chain-transfers/<int:pk>/assign/", AdminChainTransferAssignView.as_view(), name="api_admin_chain_transfer_assign"),
-    path("chain-transfers/<int:pk>/approve/", AdminChainTransferApproveView.as_view(), name="api_admin_chain_transfer_approve"),
-    path("chain-transfers/<int:pk>/flag/", AdminChainTransferFlagView.as_view(), name="api_admin_chain_transfer_flag"),
-    path("bank-deposits/<int:pk>/reject/", AdminBankRejectView.as_view(), name="api_admin_bank_reject"),
-    path("reconciliation/", AdminReconciliationView.as_view(), name="api_admin_reconciliation"),
-    path("reconciliation/discrepancies/<int:pk>/resolve/", AdminDiscrepancyResolveView.as_view(), name="api_admin_discrepancy_resolve"),
 ]
