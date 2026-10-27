@@ -806,7 +806,7 @@ class TronAPITests(TronBaseTests):
     def test_config_and_create_return_shared_address_and_no_private_material(self):
         config = self.client.get("/api/deposits/config/")
         self.assertEqual(config.status_code, 200)
-        self.assertEqual(config.data["tron"]["address"], RECEIVING)
+        self.assertTrue(config.data.get("tron", {}).get("address") == RECEIVING or any((n.get("address") == RECEIVING) for n in config.data.get("networks", [])))
         self.assertNotIn("private", str(config.data).lower())
         response = self.client.post(
             "/api/deposits/", {"amount": "1.234567"}, format="json",

@@ -86,6 +86,28 @@ def public_deposit(deposit):
     if deposit.price_amount is not None and not deposit.quote_confirmed_at:
         instructions.pop("address", None)
     address = instructions.get("address")
+    transfers = []
+    try:
+        for transfer in deposit.chain_transfers.order_by("-block_number", "-pk")[:10]:
+            transfers.append({
+                "id": transfer.pk,
+                "txid": transfer.txid,
+                "event_index": transfer.event_index,
+                "block_number": transfer.block_number,
+                "amount": _amount_text(transfer.amount),
+                "sender_address": transfer.sender_address,
+                "recipient_address": transfer.recipient_address,
+                "confirmations": transfer.confirmations,
+                "status": transfer.status,
+                "review_reason": transfer.review_reason,
+                "attribution_reason": transfer.attribution_reason,
+                "observed_at": transfer.observed_at,
+                "updated_at": transfer.updated_at,
+                "credited_at": transfer.credited_at,
+                "is_testnet": bool(getattr(transfer.network, "is_testnet", False)),
+            })
+    except Exception:
+        transfers = []
     return {
         "id": deposit.pk, "reference": deposit.reference, "asset": deposit.asset.code,
         "rail": deposit.rail,
@@ -121,6 +143,7 @@ def public_deposit(deposit):
         "verified_amount": _amount_text(bank.verified_amount) if bank and bank.verified_amount is not None else None,
         "created_at": deposit.created_at,
         "updated_at": deposit.updated_at,
+        "chain_transfers": transfers,
     }
 
 
@@ -140,7 +163,7 @@ class DepositListCreateAPIView(APIView):
         qs = Deposit.objects.filter(
             user=request.user,
             rail__in=[Deposit.Rail.CRYPTO, Deposit.Rail.BANK],
-        ).select_related("asset", "provider", "crypto__network", "bank")
+        ).select_related("asset", "provider", "crypto__network", "bank").prefetch_related("chain_transfers__network")
         return Response([public_deposit(d) for d in qs[:100]])
 
     def post(self, request):
@@ -192,7 +215,7 @@ class DepositDetailAPIView(APIView):
 
     def get(self, request, pk):
         deposit = get_object_or_404(
-            Deposit.objects.select_related("asset", "provider", "crypto__network", "bank"),
+            Deposit.objects.select_related("asset", "provider", "crypto__network", "bank").prefetch_related("chain_transfers__network"),
             pk=pk, user=request.user,
             rail__in=[Deposit.Rail.CRYPTO, Deposit.Rail.BANK],
         )
@@ -235,9 +258,8 @@ class DepositConfigAPIView(APIView):
                 {
                     "type": "crypto",
                     "enabled": False,
-                    "label": "Crypto payment (USDT TRC20)",
+                    "label": "Crypto deposit",
                     "currency": "USDT",
-                    "network": "TRON (TRC20)",
                 },
             ],
             "bank": {
@@ -248,6 +270,7 @@ class DepositConfigAPIView(APIView):
                     "details. Never send funds to details from another source."
                 ),
             },
+            "networks": [],
         }
         if crypto_mode == "direct_tron":
             tron_option_enabled = bool(getattr(settings, "TRON_DEPOSITS_ENABLED", False))
@@ -296,17 +319,85 @@ class DepositConfigAPIView(APIView):
                         "is_testnet": tron_cfg.get("is_testnet"),
                         "error": error_msg,
                     }
+                networks = []
+                if tron_option_enabled:
+                    networks.append({
+                        "id": "tron_trc20",
+                        "key": "TRC20",
+                        "label": "TRON (TRC20)",
+                        "asset": tron_cfg.get("asset") or "USDT",
+                        "chain": "TRON",
+                        "token_standard": "TRC20",
+                        "contract_address": (tron_cfg.get("contract_address") or "") if requests_enabled else "",
+                        "address": (tron_cfg.get("address") or "") if requests_enabled else "",
+                        "decimals": tron_cfg.get("decimals") or 6,
+                        "confirmations": tron_cfg.get("required_confirmations") if tron_cfg.get("required_confirmations") is not None else getattr(settings, "TRON_REQUIRED_CONFIRMATIONS", 0),
+                        "min_amount": tron_cfg.get("min_amount") or getattr(settings, "TRON_MIN_DEPOSIT", None),
+                        "max_amount": tron_cfg.get("max_amount") or getattr(settings, "TRON_MAX_DEPOSIT", None),
+                        "enabled": bool(requests_enabled),
+                        "display_enabled": True,
+                        "configured": True,
+                        "is_testnet": bool(tron_cfg.get("is_testnet")),
+                        "instructions": "Only send USDT on the TRON (TRC20) network to this address.",
+                    })
+                # Add ERC20/BEP20 if configured
+                erc20_addr = getattr(settings, "ETHEREUM_USDT_RECEIVING_ADDRESS", "") or ""
+                if erc20_addr and getattr(settings, "ETHEREUM_DEPOSITS_ENABLED", False):
+                    networks.append({
+                        "id": "eth_erc20",
+                        "key": "ERC20",
+                        "label": "Ethereum (ERC20)",
+                        "asset": "USDT",
+                        "chain": "ETHEREUM",
+                        "token_standard": "ERC20",
+                        "contract_address": getattr(settings, "ETHEREUM_USDT_CONTRACT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"),
+                        "address": erc20_addr,
+                        "decimals": 6,
+                        "confirmations": getattr(settings, "ETHEREUM_REQUIRED_CONFIRMATIONS", 12),
+                        "min_amount": getattr(settings, "TRON_MIN_DEPOSIT", "1"),
+                        "max_amount": getattr(settings, "TRON_MAX_DEPOSIT", "100000"),
+                        "enabled": bool(deposits_enabled),
+                        "display_enabled": True,
+                        "configured": True,
+                        "is_testnet": False,
+                        "instructions": "Only send USDT on the Ethereum (ERC20) network to this address.",
+                    })
+                bep20_addr = getattr(settings, "BSC_USDT_RECEIVING_ADDRESS", "") or ""
+                if bep20_addr and getattr(settings, "BSC_DEPOSITS_ENABLED", False):
+                    networks.append({
+                        "id": "bsc_bep20",
+                        "key": "BEP20",
+                        "label": "BNB Smart Chain (BEP20)",
+                        "asset": "USDT",
+                        "chain": "BSC",
+                        "token_standard": "BEP20",
+                        "contract_address": getattr(settings, "BSC_USDT_CONTRACT", "0x55d398326f99059fF775485246999027B3197955"),
+                        "address": bep20_addr,
+                        "decimals": 18,
+                        "confirmations": getattr(settings, "BSC_REQUIRED_CONFIRMATIONS", 15),
+                        "min_amount": getattr(settings, "TRON_MIN_DEPOSIT", "1"),
+                        "max_amount": getattr(settings, "TRON_MAX_DEPOSIT", "100000"),
+                        "enabled": bool(deposits_enabled),
+                        "display_enabled": True,
+                        "configured": True,
+                        "is_testnet": False,
+                        "instructions": "Only send USDT on the BNB Smart Chain (BEP20) network to this address.",
+                    })
+                result["networks"] = networks
                 for method in result["methods"]:
                     if method.get("type") == "crypto":
-                        method["configured"] = True
-                        method["display_enabled"] = tron_option_enabled
-                        method["enabled"] = requests_enabled
-                        if requests_enabled:
-                            method["address"] = tron_cfg.get("address") or ""
-                            method["contract"] = tron_cfg.get("contract_address") or ""
+                        method["configured"] = bool(networks)
+                        method["display_enabled"] = any(n.get("display_enabled") for n in networks)
+                        method["enabled"] = any(n.get("enabled") for n in networks)
+                        method["networks"] = networks
+                        if networks and any(n.get("enabled") for n in networks):
+                            active = next((n for n in networks if n.get("enabled")), networks[0])
+                            method["address"] = active.get("address") or ""
+                            method["contract"] = active.get("contract_address") or ""
+                            method["network"] = active.get("label") or "TRON (TRC20)"
                             method["instructions"] = (
-                                "Copy the USDT TRC20 wallet address below and send your USDT from your wallet. "
-                                "Only send USDT on the TRON (TRC20) network."
+                                "Select a network below and send USDT to the displayed address. "
+                                "Only send on the selected network."
                             )
                         break
         else:
@@ -318,6 +409,7 @@ class DepositConfigAPIView(APIView):
                 "live_enabled": False,
                 "error": "Direct TRON deposits are not active.",
             }
+            result["networks"] = []
         return Response(result)
 
 

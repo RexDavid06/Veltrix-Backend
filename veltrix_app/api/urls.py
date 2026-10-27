@@ -54,6 +54,7 @@ urlpatterns = [
 
     path("deposits/", DepositListCreateAPIView.as_view(), name="api_deposits"),
     path("deposits/config/", DepositConfigAPIView.as_view(), name="api_deposit_config"),
+    path("deposits/config", DepositConfigAPIView.as_view(), name="api_deposit_config_noslash"),
     path("deposits/bank/", BankDepositCreateAPIView.as_view(), name="api_bank_deposit_create"),
     path("deposits/<int:pk>/", DepositDetailAPIView.as_view(), name="api_deposit_detail"),
     path("deposits/<int:pk>/txid/", DepositTxidAPIView.as_view(), name="api_deposit_txid"),

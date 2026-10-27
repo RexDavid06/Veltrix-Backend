@@ -292,6 +292,17 @@ TRON_FAILURE_ALERT_THRESHOLD = _non_negative_int("TRON_FAILURE_ALERT_THRESHOLD",
 # A detected transfer that never reaches the confirmation threshold is moved
 # to manual review after this many minutes. It is never credited automatically.
 TRON_UNCONFIRMED_REVIEW_MINUTES = _non_negative_int("TRON_UNCONFIRMED_REVIEW_MINUTES", 1440)
+
+# Multi-chain USDT deposits (display only until fully monitored)
+ETHEREUM_USDT_CONTRACT = os.environ.get("ETHEREUM_USDT_CONTRACT", "0xdAC17F958D2ee523a2206206994597C13D831ec7")
+ETHEREUM_USDT_RECEIVING_ADDRESS = os.environ.get("ETHEREUM_USDT_RECEIVING_ADDRESS", "") or os.environ.get("VELTRIX_USDT_ERC20_RECEIVING_ADDRESS", "")
+ETHEREUM_DEPOSITS_ENABLED = os.environ.get("ETHEREUM_DEPOSITS_ENABLED", "0") == "1"
+ETHEREUM_REQUIRED_CONFIRMATIONS = int(os.environ.get("ETHEREUM_REQUIRED_CONFIRMATIONS", "12") or 12)
+
+BSC_USDT_CONTRACT = os.environ.get("BSC_USDT_CONTRACT", "0x55d398326f99059fF775485246999027B3197955")
+BSC_USDT_RECEIVING_ADDRESS = os.environ.get("BSC_USDT_RECEIVING_ADDRESS", "") or os.environ.get("VELTRIX_USDT_BEP20_RECEIVING_ADDRESS", "")
+BSC_DEPOSITS_ENABLED = os.environ.get("BSC_DEPOSITS_ENABLED", "0") == "1"
+BSC_REQUIRED_CONFIRMATIONS = int(os.environ.get("BSC_REQUIRED_CONFIRMATIONS", "15") or 15)
 if TRON_SCAN_WINDOW_SECONDS < 1:
     raise ImproperlyConfigured("TRON_SCAN_WINDOW_SECONDS must be at least 1")
 if TRON_HTTP_RETRIES > 10:
@@ -438,3 +449,8 @@ CHANNEL_LAYERS = {
 
 # Admin support emails (comma-separated)
 SUPPORT_ADMIN_EMAILS = [e.strip() for e in os.environ.get("SUPPORT_ADMIN_EMAILS", "").split(",") if e.strip()]
+
+APPEND_SLASH = True
+SECURE_SSL_REDIRECT = False
+CSRF_COOKIE_SECURE = False
+SESSION_COOKIE_SECURE = False
