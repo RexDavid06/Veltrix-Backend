@@ -11,7 +11,7 @@ RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
 COPY . /app
 
-RUN python manage.py collectstatic --noinput
+RUN SECRET_KEY=veltrix-static-build-only-not-a-production-secret python manage.py collectstatic --noinput
 
 # Migrations run on every start: the container filesystem (and Render's disk)
 # is wiped on each deploy, so the API would otherwise answer register/login
