@@ -251,7 +251,9 @@ class DepositConfigAPIView(APIView):
         }
         if crypto_mode == "direct_tron":
             tron_option_enabled = bool(getattr(settings, "TRON_DEPOSITS_ENABLED", False))
-            requests_enabled = bool(deposits_enabled and tron_option_enabled)
+            live_funding_verified = bool(getattr(settings, "FUNDING_LIVE_VERIFIED", False))
+            tron_live_verified = bool(getattr(settings, "TRON_LIVE_VERIFIED", False))
+            requests_enabled = bool(deposits_enabled and tron_option_enabled and live_funding_verified and tron_live_verified)
             try:
                 tron_cfg = public_tron_configuration()
             except TronConfigurationError as exc:
@@ -270,24 +272,29 @@ class DepositConfigAPIView(APIView):
                         "configured": True,
                         "display_enabled": True,
                         "requests_enabled": True,
+                        "live_enabled": True,
                     }
                 else:
+                    if tron_option_enabled and deposits_enabled and (not live_funding_verified or not tron_live_verified):
+                        error_msg = "Direct TRON deposits are configured, but live verification is pending. New deposit requests are not open on this deployment."
+                    elif tron_option_enabled and deposits_enabled:
+                        error_msg = "Direct TRON deposits are configured, but new deposit requests are not open on this deployment."
+                    elif tron_option_enabled:
+                        error_msg = "Direct TRON deposits are configured, but new deposit requests are not open on this deployment."
+                    else:
+                        error_msg = "Direct TRON deposits are not enabled on this deployment."
                     result["tron"] = {
                         "configured": True,
                         "display_enabled": tron_option_enabled,
                         "enabled": False,
                         "requests_enabled": False,
-                        "live_enabled": False,
+                        "live_enabled": live_funding_verified and tron_live_verified,
                         "network": tron_cfg.get("network"),
                         "token_standard": tron_cfg.get("token_standard"),
                         "asset": tron_cfg.get("asset"),
                         "decimals": tron_cfg.get("decimals"),
                         "is_testnet": tron_cfg.get("is_testnet"),
-                        "error": (
-                            "Direct TRON deposits are configured, but new deposit requests are not open on this deployment."
-                            if tron_option_enabled
-                            else "Direct TRON deposits are not enabled on this deployment."
-                        ),
+                        "error": error_msg,
                     }
                 for method in result["methods"]:
                     if method.get("type") == "crypto":
