@@ -40,6 +40,6 @@ def get_available_networks():
 def get_network_address(key):
     for cfg in DEPOSIT_NETWORKS:
         if cfg['key'] == key:
-            addr = os.environ.get(cfg['env_var'], '') or ''
+            addr = os.environ.get(cfg['env_var'], '') or getattr(__import__('django.conf').conf.settings, cfg['env_var'], '') or ''
             return addr.strip() if addr.strip() else None
     return None

@@ -213,29 +213,49 @@ def get_configured_network(*, live=None) -> Network:
 
 def public_tron_configuration() -> dict:
     """Return non-secret configuration that every client may see."""
-    require_tron_chain_configuration(live=False)
-    return {
-        "address": receiving_address(),
-        "network": "TRON",
-        "token_standard": "TRC20",
-        "asset": "USDT",
-        "decimals": USDT_DECIMALS,
-        "contract_address": configured_contract(),
-        "enabled": bool(
-            settings.TRON_DEPOSITS_ENABLED and settings.FUNDING_DEPOSITS_ENABLED
-        ),
-        "live_enabled": bool(
-            settings.TRON_NETWORK == "mainnet"
-            and settings.TRON_LIVE_VERIFIED
-            and settings.TRON_DEPOSITS_ENABLED
-            and settings.FUNDING_DEPOSITS_ENABLED
-        ),
-        "is_testnet": bool(settings.TRON_NETWORK == "testnet"),
-        "unique_amount_enabled": bool(settings.TRON_UNIQUE_AMOUNT_ENABLED),
-        "expires_after_minutes": int(settings.TRON_REQUEST_TTL_MINUTES or 0),
-        "min_amount": settings.TRON_MIN_DEPOSIT,
-        "max_amount": settings.TRON_MAX_DEPOSIT,
-    }
+    try:
+        require_tron_chain_configuration(live=False)
+        return {
+            "address": receiving_address(),
+            "network": "TRON",
+            "token_standard": "TRC20",
+            "asset": "USDT",
+            "decimals": USDT_DECIMALS,
+            "contract_address": configured_contract(),
+            "enabled": bool(
+                settings.TRON_DEPOSITS_ENABLED and settings.FUNDING_DEPOSITS_ENABLED
+            ),
+            "live_enabled": bool(
+                settings.TRON_NETWORK == "mainnet"
+                and settings.TRON_LIVE_VERIFIED
+                and settings.TRON_DEPOSITS_ENABLED
+                and settings.FUNDING_DEPOSITS_ENABLED
+            ),
+            "is_testnet": bool(settings.TRON_NETWORK == "testnet"),
+            "unique_amount_enabled": bool(settings.TRON_UNIQUE_AMOUNT_ENABLED),
+            "expires_after_minutes": int(settings.TRON_REQUEST_TTL_MINUTES or 0),
+            "min_amount": settings.TRON_MIN_DEPOSIT,
+            "max_amount": settings.TRON_MAX_DEPOSIT,
+            "configured": True,
+        }
+    except Exception as exc:
+        return {
+            "address": None,
+            "network": "TRON",
+            "token_standard": "TRC20",
+            "asset": "USDT",
+            "decimals": USDT_DECIMALS,
+            "contract_address": None,
+            "enabled": False,
+            "live_enabled": False,
+            "is_testnet": bool(getattr(settings, "TRON_NETWORK", "") == "testnet"),
+            "unique_amount_enabled": False,
+            "expires_after_minutes": 0,
+            "min_amount": None,
+            "max_amount": None,
+            "configured": False,
+            "error": str(exc),
+        }
 
 
 def _extract_transfer(item, *, expected_contract: str, decimals: int, require_timestamp: bool):
