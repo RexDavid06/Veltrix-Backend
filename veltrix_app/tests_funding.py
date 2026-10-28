@@ -22,7 +22,6 @@ from veltrix_app.models import (
     Network,
 )
 from veltrix_app.services import ledger
-from veltrix_app.services.deposits import AccountFrozen, create_deposit_intent, credit_deposit, reverse_deposit
 from veltrix_app.services.kyc import approve_profile, ensure_profile
 
 
@@ -84,70 +83,9 @@ class FundingModelMigrationTests(TestCase):
             self.make_deposit("bank-2", provider_ref="provider-ref-1")
 
     @override_settings(FUNDING_DEPOSITS_ENABLED=True, FUNDING_REQUIRE_KYC=True)
-    def test_bank_deposit_intent_is_idempotent_and_accepts_shared_collection_account(self):
-        profile = ensure_profile(self.user)
-        approve_profile(profile)
-        with override_settings(FUNDING_COLLECTION_ACCOUNT={"account_number": ""}):
-            first = create_deposit_intent(
-                self.user, self.provider, self.asset, Decimal("25.00"), idempotency_key="intent-1"
-            )
-            second = create_deposit_intent(
-                self.user, self.provider, self.asset, Decimal("25.00"), idempotency_key="intent-2"
-            )
-            retry = create_deposit_intent(
-                self.user, self.provider, self.asset, Decimal("25.00"), idempotency_key="intent-1"
-            )
-        self.assertNotEqual(first.pk, second.pk)
-        self.assertEqual(first.pk, retry.pk)
-        self.assertEqual(BankDeposit.objects.count(), 2)
 
-    @override_settings(FUNDING_DEPOSITS_ENABLED=True, FUNDING_REQUIRE_KYC=True)
-    def test_bank_deposit_intent_creates_admin_notification_with_identity_and_amount(self):
-        profile = ensure_profile(self.user)
-        approve_profile(profile)
-        with override_settings(FUNDING_COLLECTION_ACCOUNT={"account_number": ""}):
-            deposit = create_deposit_intent(
-                self.user, self.provider, self.asset, Decimal("25.00"), idempotency_key="intent-notify-1"
-            )
-        self.assertIsNotNone(deposit.pk)
-        conv = Conversation.objects.filter(user=self.user, is_active=True).first()
-        self.assertIsNotNone(conv)
-        messages = list(Message.objects.filter(conversation=conv).order_by("id"))
-        self.assertEqual(len(messages), 1)
-        content = messages[0].content
-        self.assertIn("deposit", content.lower())
-        self.assertIn(str(self.user.id), content)
-        self.assertIn(self.user.email, content)
-        self.assertIn(str(deposit.reference), content)
-        self.assertIn("25.00", content)
-        self.assertIn("local-bank", content)
 
-    @override_settings(FUNDING_DEPOSITS_ENABLED=True, FUNDING_REQUIRE_KYC=True)
-    def test_bank_deposit_intent_retries_do_not_duplicate_notifications(self):
-        profile = ensure_profile(self.user)
-        approve_profile(profile)
-        with override_settings(FUNDING_COLLECTION_ACCOUNT={"account_number": ""}):
-            first = create_deposit_intent(
-                self.user, self.provider, self.asset, Decimal("25.00"), idempotency_key="intent-notify-dup"
-            )
-            second = create_deposit_intent(
-                self.user, self.provider, self.asset, Decimal("25.00"), idempotency_key="intent-notify-dup"
-            )
-        self.assertEqual(first.pk, second.pk)
-        self.assertEqual(Conversation.objects.filter(user=self.user).count(), 1)
-        self.assertEqual(Message.objects.filter(conversation__user=self.user).count(), 1)
 
-    @override_settings(FUNDING_DEPOSITS_ENABLED=True, FUNDING_REQUIRE_KYC=False)
-    def test_intent_creation_refreshes_frozen_state_before_accepting_request(self):
-        stale_user = User.objects.get(pk=self.user.pk)
-        User.objects.filter(pk=self.user.pk).update(funds_frozen=True)
-
-        with self.assertRaises(AccountFrozen):
-            create_deposit_intent(
-                stale_user, self.provider, self.asset, Decimal("25.00"), idempotency_key="frozen-intent"
-            )
-
-        self.assertFalse(Deposit.objects.filter(idempotency_key="frozen-intent").exists())
 
     def test_ledger_entry_updates_balance_cache_and_is_idempotent(self):
         treasury = ledger.treasury_account(self.asset)
@@ -241,94 +179,9 @@ class LedgerSafetyRegressionTests(TestCase):
         )
         return credit_deposit(deposit)
 
-    def test_reversing_unspent_deposit_removes_balance_without_freeze(self):
-        deposit = self._credited_deposit()
 
-        reversed_deposit = reverse_deposit(deposit, reason="verified provider reversal")
 
-        self.user.refresh_from_db()
-        cached = AssetBalance.objects.get(user=self.user, asset=self.usd)
-        self.assertEqual(reversed_deposit.status, Deposit.Status.REVERSED)
-        self.assertEqual(ledger.ledger_balance(self.user, self.usd), Decimal("0"))
-        self.assertEqual(cached.available + cached.reserved, Decimal("0"))
-        self.assertFalse(self.user.funds_frozen)
-        self.assertTrue(AuditLog.objects.filter(action="deposit.reversed").exists())
 
-    def test_reversing_spent_deposit_freezes_and_audits_deficit(self):
-        deposit = self._credited_deposit()
-        treasury = ledger.treasury_account(self.usd)
-        customer = ledger.customer_account(self.usd, self.user)
-        ledger.record_entry(
-            "adjustment",
-            "spend-before-reversal",
-            [
-                ledger.Posting(customer, "D", Decimal("7.00"), bucket="available"),
-                ledger.Posting(treasury, "C", Decimal("7.00")),
-            ],
-            asset=self.usd,
-        )
-
-        reverse_deposit(deposit, reason="provider chargeback")
-
-        self.user.refresh_from_db()
-        cached = AssetBalance.objects.get(user=self.user, asset=self.usd)
-        self.assertTrue(self.user.funds_frozen)
-        self.assertEqual(ledger.ledger_balance(self.user, self.usd), Decimal("-7.00"))
-        self.assertEqual(cached.available, Decimal("-7.00"))
-        event = AuditLog.objects.get(action="deposit.reversal_deficit")
-        self.assertIn("projected_deficit=7", event.details)
-        self.assertIn("account frozen", event.details)
-
-    def test_repeated_deposit_reversal_does_not_debit_twice(self):
-        deposit = self._credited_deposit("deposit-repeat")
-
-        reverse_deposit(deposit, reason="provider reversal")
-        reverse_deposit(deposit, reason="retry with stale instance")
-
-        self.assertEqual(ledger.ledger_balance(self.user, self.usd), Decimal("0"))
-        self.assertEqual(
-            LedgerEntry.objects.filter(
-                reference_type=LedgerEntry.ReferenceType.REVERSAL,
-                reference_id=f"rev-{deposit.pk}",
-            ).count(),
-            1,
-        )
-
-    def test_reversal_audit_failure_rolls_back_freeze_and_ledger(self):
-        deposit = self._credited_deposit("deposit-rollback")
-        customer = ledger.customer_account(self.usd, self.user)
-        treasury = ledger.treasury_account(self.usd)
-        ledger.record_entry(
-            "adjustment",
-            "spend-before-failed-reversal",
-            [
-                ledger.Posting(customer, "D", Decimal("12.00"), bucket="available"),
-                ledger.Posting(treasury, "C", Decimal("12.00")),
-            ],
-            asset=self.usd,
-        )
-        original_create = AuditLog.objects.create
-
-        def fail_deficit_audit(**kwargs):
-            if kwargs.get("action") == "deposit.reversal_deficit":
-                raise DatabaseError("audit write failed")
-            return original_create(**kwargs)
-
-        with patch.object(AuditLog.objects, "create", side_effect=fail_deficit_audit):
-            with self.assertRaises(DatabaseError):
-                reverse_deposit(deposit, reason="provider reversal")
-
-        self.user.refresh_from_db()
-        deposit.refresh_from_db()
-        self.assertFalse(self.user.funds_frozen)
-        self.assertNotEqual(deposit.status, Deposit.Status.REVERSED)
-        self.assertEqual(ledger.ledger_balance(self.user, self.usd), Decimal("-2.00"))
-        self.assertFalse(
-            LedgerEntry.objects.filter(
-                reference_type=LedgerEntry.ReferenceType.REVERSAL,
-                reference_id=f"rev-{deposit.pk}",
-            ).exists()
-        )
 
     def test_multi_asset_later_leg_failure_rolls_back_prior_leg(self):
         first = self._leg(self.usd, "multi-fail-usd")

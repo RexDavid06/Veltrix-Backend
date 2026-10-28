@@ -19,3 +19,11 @@ urlpatterns = [
     path("instruments/<int:pk>/", AdminInstrumentDetailView.as_view(), name="api_admin_instrument_detail"),
     path("audit/", AdminAuditLogListView.as_view(), name="api_admin_audit"),
 ]
+
+from .admin_views import AdminDepositsListView, AdminDepositActionView, AdminUserDepositsView
+
+urlpatterns += [
+    path("deposits/", AdminDepositsListView.as_view(), name="api_admin_deposits_list"),
+    path("deposits/<int:pk>/action/", AdminDepositActionView.as_view(), name="api_admin_deposit_action"),
+    path("users/<int:pk>/deposits/", AdminUserDepositsView.as_view(), name="api_admin_user_deposits"),
+]

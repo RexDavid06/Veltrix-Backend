@@ -69,3 +69,33 @@ urlpatterns = [
     # Admin dashboard API (every endpoint is guarded by IsPlatformAdmin)
     path("admin/", include("veltrix_app.api.admin_urls")),
 ]
+
+from .deposits import DepositListCreateView, DepositConfigView
+urlpatterns += [
+    path("deposits/", DepositListCreateView.as_view(), name="api_deposits"),
+    path("deposits/config/", DepositConfigView.as_view(), name="api_deposits_config"),
+]
+
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework import status
+
+class GoneView(APIView):
+    authentication_classes = []
+    permission_classes = []
+    def get(self, request, *args, **kwargs):
+        return Response(status=status.HTTP_410_GONE)
+    def post(self, request, *args, **kwargs):
+        return Response(status=status.HTTP_410_GONE)
+    def put(self, request, *args, **kwargs):
+        return Response(status=status.HTTP_410_GONE)
+    def patch(self, request, *args, **kwargs):
+        return Response(status=status.HTTP_410_GONE)
+    def delete(self, request, *args, **kwargs):
+        return Response(status=status.HTTP_410_GONE)
+
+# Neutralize legacy deposit paths
+urlpatterns += [
+    path("deposits/legacy/", GoneView.as_view()),
+    path("wallet/deposits/", GoneView.as_view()),
+]

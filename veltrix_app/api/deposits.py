@@ -1,0 +1,248 @@
+from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
+
+from django.db import transaction
+from django.utils import timezone
+from rest_framework import permissions, status
+from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.views import APIView
+
+from veltrix_app.api.permissions import IsPlatformAdmin
+from veltrix_app.deposits_config import get_available_networks, get_network_address, DEPOSIT_NETWORKS
+from veltrix_app.models import DepositRequest, DemoAccount, Transaction, AuditLog, User
+from django.db.models import F
+from django.conf import settings
+import json
+from veltrix_app.utils_deposits import generate_deposit_reference
+
+
+class DepositRateThrottle(ScopedRateThrottle):
+    scope = 'deposit_create'
+
+
+EXPLORERS = {
+    'USDT_TRC20': 'https://tronscan.org/#/transaction/',
+    'USDT_ERC20': 'https://etherscan.io/tx/',
+    'USDT_BEP20': 'https://bscscan.com/tx/',
+}
+
+
+class DepositConfigView(APIView):
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request):
+        nets = []
+        for cfg in DEPOSIT_NETWORKS:
+            addr = get_network_address(cfg['key'])
+            if addr:
+                nets.append({
+                    'key': cfg['key'],
+                    'label': cfg['label'],
+                    'address': addr,
+                    'env_var': cfg['env_var'],
+                })
+        return Response({'networks': nets})
+
+
+class DepositListCreateView(APIView):
+    permission_classes = (permissions.IsAuthenticated,)
+    throttle_classes = [DepositRateThrottle]
+
+    def get(self, request):
+        deposits = DepositRequest.objects.filter(user=request.user)
+        data = []
+        for d in deposits:
+            data.append({
+                'id': d.id,
+                'method': d.method,
+                'network': d.network,
+                'amount': str(d.amount),
+                'received_amount': str(d.received_amount) if d.received_amount is not None else None,
+                'currency': d.currency,
+                'tx_hash': d.tx_hash,
+                'sender_address': d.sender_address,
+                'sender_name': d.sender_name,
+                'reference': d.reference,
+                'note': d.note,
+                'status': d.status,
+                'reviewed_at': d.reviewed_at.isoformat() if d.reviewed_at else None,
+                'created_at': d.created_at.isoformat() if d.created_at else None,
+            })
+        return Response(data)
+
+    def post(self, request):
+        method = request.data.get('method')
+        if method not in [DepositRequest.Method.CARD, DepositRequest.Method.BANK, DepositRequest.Method.CRYPTO]:
+            return Response({'detail': 'Invalid method.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if method == DepositRequest.Method.CARD:
+            return Response({'detail': 'Card payments coming soon.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount = request.data.get('amount')
+        try:
+            amount_decimal = Decimal(str(amount))
+        except (InvalidOperation, TypeError):
+            return Response({'detail': 'Invalid amount.'}, status=status.HTTP_400_BAD_REQUEST)
+        if amount_decimal <= 0:
+            return Response({'detail': 'Amount must be greater than 0.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        currency = (request.data.get('currency') or 'USD').strip()[:10]
+        note = (request.data.get('note') or '').strip()[:1000]
+        tx_hash = (request.data.get('tx_hash') or '').strip() or None
+        sender_address = (request.data.get('sender_address') or '').strip() or None
+        sender_name = (request.data.get('sender_name') or '').strip() or None
+        if tx_hash:
+            tx_hash = tx_hash.strip().lower() if network in ['USDT_ERC20', 'USDT_BEP20', 'USDT_TRC20'] else tx_hash.strip()
+
+        network = None
+        if method == DepositRequest.Method.CRYPTO:
+            network = request.data.get('network')
+            if network not in {n['key'] for n in DEPOSIT_NETWORKS}:
+                return Response({'detail': 'Invalid network.'}, status=status.HTTP_400_BAD_REQUEST)
+            if not get_network_address(network):
+                return Response({'detail': 'Network not available.'}, status=status.HTTP_400_BAD_REQUEST)
+            if not sender_address or not tx_hash:
+                return Response({'detail': 'sender_address and tx_hash are required for crypto.'}, status=status.HTTP_400_BAD_REQUEST)
+        elif method == DepositRequest.Method.BANK:
+            network = None
+
+        reference = generate_deposit_reference()
+        deposit = DepositRequest.objects.create(
+            user=request.user,
+            method=method,
+            network=network,
+            amount=amount_decimal,
+            currency=currency,
+            tx_hash=tx_hash,
+            sender_address=sender_address,
+            sender_name=sender_name,
+            reference=reference,
+            note=note,
+            status=DepositRequest.Status.PENDING,
+        )
+        return Response({
+            'id': deposit.id,
+            'method': deposit.method,
+            'network': deposit.network,
+            'amount': str(deposit.amount),
+            'currency': deposit.currency,
+            'reference': deposit.reference,
+            'status': deposit.status,
+            'created_at': deposit.created_at.isoformat(),
+        }, status=status.HTTP_201_CREATED)
+
+
+class AdminDepositListView(APIView):
+    permission_classes = (IsPlatformAdmin,)
+
+    def get(self, request):
+        qs = DepositRequest.objects.select_related('user', 'admin').all()
+        status_filter = request.query_params.get('status')
+        method_filter = request.query_params.get('method')
+        q = (request.query_params.get('q') or '').strip()
+        if status_filter in [DepositRequest.Status.PENDING, DepositRequest.Status.APPROVED, DepositRequest.Status.REJECTED]:
+            qs = qs.filter(status=status_filter)
+        if method_filter in [DepositRequest.Method.CARD, DepositRequest.Method.BANK, DepositRequest.Method.CRYPTO]:
+            qs = qs.filter(method=method_filter)
+        if q:
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(reference__icontains=q) |
+                Q(tx_hash__icontains=q) |
+                Q(sender_address__icontains=q) |
+                Q(user__email__icontains=q) |
+                Q(user__username__icontains=q)
+            )
+        data = []
+        for d in qs:
+            expected = get_network_address(d.network) if d.network else None
+            data.append({
+                'id': d.id,
+                'user_id': d.user_id,
+                'user_email': d.user.email,
+                'user_username': d.user.username,
+                'user_first_name': d.user.first_name,
+                'user_last_name': d.user.last_name,
+                'method': d.method,
+                'network': d.network,
+                'amount': str(d.amount),
+                'received_amount': str(d.received_amount) if d.received_amount is not None else None,
+                'currency': d.currency,
+                'tx_hash': d.tx_hash,
+                'sender_address': d.sender_address,
+                'sender_name': d.sender_name,
+                'reference': d.reference,
+                'note': d.note,
+                'status': d.status,
+                'admin_id': d.admin_id,
+                'expected_receiving_address': expected,
+                'explorer_url': (EXPLORERS.get(d.network) + d.tx_hash) if d.network in EXPLORERS and d.tx_hash else None,
+                'reviewed_at': d.reviewed_at.isoformat() if d.reviewed_at else None,
+                'created_at': d.created_at.isoformat() if d.created_at else None,
+            })
+        return Response(data)
+
+
+class AdminDepositActionView(APIView):
+    permission_classes = (IsPlatformAdmin,)
+
+    def post(self, request, pk):
+        action = request.data.get('action')
+        if action not in ['approve', 'reject']:
+            return Response({'detail': 'Invalid action.'}, status=status.HTTP_400_BAD_REQUEST)
+        verified = bool(request.data.get('verified'))
+        received_amount = request.data.get('received_amount')
+        with transaction.atomic():
+            deposit = DepositRequest.objects.select_for_update().get(pk=pk)
+            if deposit.status != DepositRequest.Status.PENDING:
+                return Response({'detail': 'Deposit already reviewed.'}, status=status.HTTP_400_BAD_REQUEST)
+            old_status = deposit.status
+            if action == 'reject':
+                deposit.status = DepositRequest.Status.REJECTED
+                deposit.admin = request.user
+                deposit.reviewed_at = timezone.now()
+                deposit.save(update_fields=['status', 'admin_id', 'reviewed_at', 'updated_at'])
+                AuditLog.objects.create(user=deposit.user, actor=request.user, action='deposit.status_changed', details=json.dumps({"who": request.user.id, "what": "deposit.status", "when": timezone.now().isoformat(), "old": old_status, "new": deposit.status, "reference": deposit.reference}))
+                return Response({'detail': 'Rejected.'})
+            if not verified:
+                return Response({'detail': 'Confirmation required.'}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                received_decimal = Decimal(str(received_amount))
+            except (InvalidOperation, TypeError):
+                return Response({'detail': 'Invalid received amount.'}, status=status.HTTP_400_BAD_REQUEST)
+            if received_decimal <= 0:
+                return Response({'detail': 'Received amount must be greater than 0.'}, status=status.HTTP_400_BAD_REQUEST)
+            max_dep = getattr(settings, 'MAX_DEPOSIT_AMOUNT', None)
+            if max_dep is not None:
+                try:
+                    if received_decimal > Decimal(str(max_dep)):
+                        return Response({'detail': 'Amount exceeds limit.'}, status=status.HTTP_400_BAD_REQUEST)
+                except Exception:
+                    pass
+            try:
+                if deposit.amount and deposit.amount > 0 and received_decimal > deposit.amount * Decimal('10'):
+                    return Response({'detail': 'Received amount exceeds allowed multiple of claimed amount.'}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                pass
+            deposit.status = DepositRequest.Status.APPROVED
+            deposit.admin = request.user
+            deposit.reviewed_at = timezone.now()
+            deposit.received_amount = received_decimal
+            deposit.save(update_fields=['status', 'admin_id', 'reviewed_at', 'received_amount', 'updated_at'])
+            demo = DemoAccount.objects.select_for_update().get(user=deposit.user)
+            DemoAccount.objects.filter(pk=demo.pk).update(cash_balance=F('cash_balance') + received_decimal)
+            Transaction.objects.create(
+                user=deposit.user,
+                symbol='DEPOSIT',
+                side='topup',
+                quantity=received_decimal,
+                execution_price=received_decimal,
+                amount=received_decimal,
+                status='completed',
+                note=deposit.reference,
+                deposit_request=deposit,
+            )
+            AuditLog.objects.create(user=deposit.user, actor=request.user, action='deposit.status_changed', details=json.dumps({"who": request.user.id, "what": "deposit.status", "when": timezone.now().isoformat(), "old": old_status, "new": deposit.status, "reference": deposit.reference, "claimed": str(deposit.amount), "received": str(received_decimal)}))
+            return Response({'detail': 'Approved.'})

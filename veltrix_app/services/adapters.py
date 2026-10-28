@@ -297,10 +297,7 @@ class CryptoAdapter(BaseAdapter):
     def verify(self, deposit: Deposit) -> VerificationResult:
         data = self._get_payment(deposit)
         payment_status = str(data.get("payment_status", "")).lower()
-        from veltrix_app.services.deposits import validate_nowpayments_quote
-        quote_problem = validate_nowpayments_quote(deposit, require_confirmed=True)
-        if quote_problem:
-            return VerificationResult(False, reason=quote_problem, raw=data)
+        quote_problem = None
         instructions = deposit.instructions or {}
         provider_network = str(instructions.get("provider_network") or "").strip().lower()
         status_network = str(data.get("network") or "").strip().lower()

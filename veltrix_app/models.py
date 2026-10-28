@@ -108,6 +108,7 @@ class Transaction(models.Model):
     amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="simulated")
     note = models.CharField(max_length=255, blank=True, null=True)
+    deposit_request = models.ForeignKey('DepositRequest', on_delete=models.SET_NULL, null=True, blank=True, related_name='transactions')
     created_at = models.DateTimeField(default=timezone.now)
 
 
@@ -1024,3 +1025,50 @@ class ReconciliationDiscrepancy(models.Model):
 
     def __str__(self):
         return f"ReconciliationDiscrepancy({self.kind}, {self.status})"
+
+
+class DepositRequest(models.Model):
+    class Method(models.TextChoices):
+        CARD = 'card', 'Card'
+        BANK = 'bank', 'Bank transfer'
+        CRYPTO = 'crypto', 'Crypto'
+
+    class Network(models.TextChoices):
+        USDT_TRC20 = 'USDT_TRC20', 'USDT (TRC20)'
+        USDT_ERC20 = 'USDT_ERC20', 'USDT (ERC20)'
+        USDT_BEP20 = 'USDT_BEP20', 'USDT (BEP20)'
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        REJECTED = 'rejected', 'Rejected'
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='deposit_requests')
+    method = models.CharField(max_length=10, choices=Method.choices)
+    network = models.CharField(max_length=20, choices=Network.choices, null=True, blank=True)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    received_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    currency = models.CharField(max_length=10, default='USD')
+    tx_hash = models.CharField(max_length=255, null=True, blank=True)
+    sender_address = models.CharField(max_length=255, null=True, blank=True)
+    sender_name = models.CharField(max_length=255, null=True, blank=True)
+    reference = models.CharField(max_length=32, unique=True, null=True, blank=True)
+    note = models.TextField(blank=True, default='')
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    admin = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='reviewed_deposit_requests')
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tx_hash'],
+                condition=models.Q(tx_hash__isnull=False) & ~models.Q(tx_hash='') & ~models.Q(status='rejected'),
+                name='unique_non_empty_deposit_tx_hash',
+            ),
+        ]
+
+    def __str__(self):
+        return f'DepositRequest({self.id}, {self.user_id}, {self.method}, {self.status})'

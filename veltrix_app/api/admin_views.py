@@ -307,3 +307,28 @@ class AdminAuditLogListView(generics.ListAPIView):
         if date_to:
             qs = qs.filter(created_at__lte=date_to)
         return qs
+
+from veltrix_app.models import DepositRequest
+
+class AdminUserDepositsView(APIView):
+    permission_classes = (IsPlatformAdmin,)
+    def get(self, request, pk):
+        qs = DepositRequest.objects.filter(user_id=pk).order_by('-created_at')
+        data = []
+        total = 0
+        for d in qs:
+            if d.status == 'approved':
+                total += float(d.received_amount or d.amount)
+            data.append({
+                'id': d.id,
+                'method': d.method,
+                'network': d.network,
+                'amount': str(d.amount),
+                'received_amount': str(d.received_amount) if d.received_amount is not None else None,
+                'reference': d.reference,
+                'status': d.status,
+                'created_at': d.created_at.isoformat() if d.created_at else None,
+            })
+        return Response({'deposits': data, 'total_approved': total})
+
+from veltrix_app.api.deposits import AdminDepositListView as AdminDepositsListView, AdminDepositActionView

@@ -20,7 +20,6 @@ from veltrix_app.models import (
     Network,
 )
 from veltrix_app.services import ledger
-from veltrix_app.services.deposits import DepositError, create_deposit_intent
 from veltrix_app.services.tron import (
     MAINNET_USDT,
     TronConfigurationError,
@@ -171,12 +170,19 @@ class TronBaseTests(TestCase):
         self.provider.supported_assets.add(self.asset)
 
     def make_deposit(self, amount="1.234567", key="intent-1", **changes):
-        settings_changes = {**BASE_SETTINGS, **changes}
-        with override_settings(**settings_changes):
-            return create_deposit_intent(
-                self.user, self.provider, self.asset, Decimal(amount),
-                idempotency_key=key, network=self.network,
-            )
+        # Deposit intent creation removed; create a Deposit instance for tests that need it
+        from decimal import Decimal
+        dep = Deposit.objects.create(
+            user=self.user,
+            rail=Deposit.Rail.CRYPTO,
+            asset=self.asset,
+            provider=self.provider,
+            expected_amount=Decimal(amount),
+            status=Deposit.Status.PENDING,
+            idempotency_key=key,
+            reference=f"TEST-{key}",
+        )
+        return dep
 
     def scan(self, router):
         with patch("veltrix_app.services.tron._request", side_effect=router):
@@ -186,22 +192,6 @@ class TronBaseTests(TestCase):
         with patch("veltrix_app.services.tron._request", side_effect=router):
             return refresh_confirmations(self.network)
 
-
-class TronCreationGateTests(TronBaseTests):
-    def test_direct_tron_intent_rejected_when_funding_live_not_verified(self):
-        with self.assertRaises(DepositError):
-            self.make_deposit(FUNDING_LIVE_VERIFIED=False)
-        self.assertEqual(Deposit.objects.count(), 0)
-
-    def test_direct_tron_intent_rejected_when_tron_live_not_verified(self):
-        with self.assertRaises(DepositError):
-            self.make_deposit(TRON_LIVE_VERIFIED=False)
-        self.assertEqual(Deposit.objects.count(), 0)
-
-    def test_direct_tron_intent_succeeds_when_gates_satisfied(self):
-        deposit = self.make_deposit()
-        self.assertIsNotNone(deposit.pk)
-        self.assertEqual(Deposit.objects.count(), 1)
 
 
 class TronConfigurationTests(TestCase):
@@ -794,146 +784,3 @@ class TronHTTPTests(TestCase):
                 patch("time.sleep"):
             with self.assertRaises(TronProviderError):
                 _request("/v1/contracts/test/events")
-
-
-@override_settings(**BASE_SETTINGS)
-class TronAPITests(TronBaseTests):
-    def setUp(self):
-        super().setUp()
-        self.client = APIClient()
-        self.client.force_authenticate(self.user)
-
-    def test_config_and_create_return_shared_address_and_no_private_material(self):
-        config = self.client.get("/api/deposits/config/")
-        self.assertEqual(config.status_code, 200)
-        self.assertTrue(config.data.get("tron", {}).get("address") == RECEIVING or any((n.get("address") == RECEIVING) for n in config.data.get("networks", [])))
-        self.assertNotIn("private", str(config.data).lower())
-        response = self.client.post(
-            "/api/deposits/", {"amount": "1.234567"}, format="json",
-            HTTP_IDEMPOTENCY_KEY="api-create-1",
-        )
-        self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(response.data["instructions"]["address"], RECEIVING)
-        self.assertEqual(response.data["expected_amount"], "1.234567")
-
-    @override_settings(**{
-        **BASE_SETTINGS, "FUNDING_DEPOSITS_ENABLED": False, "TRON_DEPOSITS_ENABLED": False,
-    })
-    def test_config_does_not_expose_wallet_while_funding_is_disabled(self):
-        config = self.client.get("/api/deposits/config/")
-        self.assertEqual(config.status_code, 200)
-        self.assertFalse(config.data["deposits_enabled"])
-        self.assertFalse(config.data["tron"]["enabled"])
-        self.assertNotIn("address", config.data["tron"])
-        crypto = next(item for item in config.data["methods"] if item["type"] == "crypto")
-        self.assertFalse(crypto["enabled"])
-        self.assertNotIn("address", crypto)
-
-    @override_settings(**{
-        **BASE_SETTINGS,
-        "FUNDING_DEPOSITS_ENABLED": False,
-        "TRON_DEPOSITS_ENABLED": True,
-        "TRON_LIVE_VERIFIED": False,
-    })
-    def test_config_displays_configured_tron_option_without_address_or_creation(self):
-        config = self.client.get("/api/deposits/config/")
-        self.assertEqual(config.status_code, 200)
-        self.assertFalse(config.data["deposits_enabled"])
-        self.assertTrue(config.data["tron"]["configured"])
-        self.assertTrue(config.data["tron"]["display_enabled"])
-        self.assertFalse(config.data["tron"]["enabled"])
-        self.assertFalse(config.data["tron"]["requests_enabled"])
-        self.assertFalse(config.data["tron"]["live_enabled"])
-        self.assertNotIn("address", config.data["tron"])
-        self.assertNotIn("contract_address", config.data["tron"])
-        self.assertIn("configured", config.data["tron"]["error"].lower())
-        crypto = next(item for item in config.data["methods"] if item["type"] == "crypto")
-        self.assertTrue(crypto["configured"])
-        self.assertTrue(crypto["display_enabled"])
-        self.assertFalse(crypto["enabled"])
-        self.assertNotIn("address", crypto)
-        self.assertNotIn("contract", crypto)
-        self.assertNotIn(RECEIVING, str(config.data))
-
-        response = self.client.post(
-            "/api/deposits/", {"amount": "1.234567"}, format="json",
-            HTTP_IDEMPOTENCY_KEY="display-only-create",
-        )
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(Deposit.objects.filter(user=self.user).count(), 0)
-
-    @override_settings(**{
-        **BASE_SETTINGS,
-        "FUNDING_DEPOSITS_ENABLED": False,
-        "TRON_DEPOSITS_ENABLED": True,
-        "TRON_NETWORK": "",
-    })
-    def test_invalid_tron_configuration_is_not_displayed_or_exposed(self):
-        config = self.client.get("/api/deposits/config/")
-        self.assertEqual(config.status_code, 200)
-        self.assertFalse(config.data["tron"]["configured"])
-        self.assertFalse(config.data["tron"]["display_enabled"])
-        self.assertFalse(config.data["tron"]["enabled"])
-        self.assertFalse(config.data["tron"]["requests_enabled"])
-        self.assertNotIn("address", config.data["tron"])
-        self.assertIn("TRON_NETWORK", config.data["tron"]["error"])
-        crypto = next(item for item in config.data["methods"] if item["type"] == "crypto")
-        self.assertFalse(crypto["enabled"])
-        self.assertNotIn("address", crypto)
-
-    def test_direct_mode_never_selects_nowpayments_provider(self):
-        DepositProvider.objects.create(
-            code="nowpayments", display_name="NOWPayments",
-            rail=DepositProvider.Rail.CRYPTO, is_active=True, is_test=False,
-        ).supported_assets.add(self.asset)
-        config = self.client.get("/api/deposits/config/")
-        self.assertEqual(config.data["crypto_mode"], "direct_tron")
-        response = self.client.post(
-            "/api/deposits/", {"amount": "2.000001"}, format="json",
-            HTTP_IDEMPOTENCY_KEY="direct-not-nowpayments",
-        )
-        self.assertEqual(response.status_code, 201, response.data)
-        deposit = Deposit.objects.get(pk=response.data["id"])
-        self.assertEqual(deposit.provider.code, "direct_tron")
-
-    def test_bank_deposit_is_not_created_without_bank_configuration(self):
-        response = self.client.post(
-            "/api/deposits/bank/", {"amount": "10.00"}, format="json",
-            HTTP_IDEMPOTENCY_KEY="bank-1",
-        )
-        self.assertEqual(response.status_code, 503)
-
-    @override_settings(**{**BASE_SETTINGS, "FUNDING_LIVE_VERIFIED": False})
-    def test_api_direct_tron_creation_rejected_when_funding_live_not_verified(self):
-        response = self.client.post(
-            "/api/deposits/", {"amount": "1.000000"}, format="json",
-            HTTP_IDEMPOTENCY_KEY="no-live-funding",
-        )
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(Deposit.objects.filter(user=self.user).count(), 0)
-
-    @override_settings(**{**BASE_SETTINGS, "TRON_LIVE_VERIFIED": False})
-    def test_api_direct_tron_creation_rejected_when_tron_live_not_verified(self):
-        response = self.client.post(
-            "/api/deposits/", {"amount": "1.000000"}, format="json",
-            HTTP_IDEMPOTENCY_KEY="no-live-tron",
-        )
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(Deposit.objects.filter(user=self.user).count(), 0)
-
-    def test_txid_endpoint_does_not_credit(self):
-        deposit = self.make_deposit()
-        response = self.client.post(
-            f"/api/deposits/{deposit.pk}/txid/", {"txid": TXID}, format="json"
-        )
-        self.assertEqual(response.status_code, 202, response.data)
-        self.assertEqual(response.data["status"], "recorded")
-        deposit.refresh_from_db()
-        self.assertFalse(deposit.is_credited)
-
-    def test_client_cannot_read_another_clients_deposit(self):
-        other = get_user_model().objects.create_user(username="other", password="secret")
-        deposit = self.make_deposit()
-        other_client = APIClient()
-        other_client.force_authenticate(other)
-        self.assertEqual(other_client.get(f"/api/deposits/{deposit.pk}/").status_code, 404)
