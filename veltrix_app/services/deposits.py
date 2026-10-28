@@ -1,0 +1,1098 @@
+"""The deposit pipeline: intent, detection, verification, credit, reversal.
+
+The pipeline is rail-agnostic. Each rail only has to answer three questions:
+
+* what does the client need to do (instructions),
+* has the money actually arrived (detection), and
+* is it genuinely ours to keep (verification).
+
+Everything after that - the ledger postings, the balances, the reserve
+window, the reversal - is shared.
+
+The one rule that overrides every other consideration: **credit only from an
+independently verified external fact**. Never from the client's own request,
+and never from a webhook body that has not been checked against the
+provider.
+"""
+
+from __future__ import annotations
+
+import secrets
+import string
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from datetime import timedelta
+
+from django.conf import settings
+from django.core.mail import send_mail
+from django.db import models, transaction
+from django.utils import timezone
+
+from veltrix_app.models import (
+    Asset,
+    AssetBalance,
+    AuditLog,
+    BankDeposit,
+    CardDeposit,
+    Conversation,
+    CryptoDeposit,
+    Deposit,
+    DepositProvider,
+    LedgerEntry,
+    Message,
+    Network,
+    User,
+)
+from veltrix_app.services import ledger
+from veltrix_app.services.ledger import Posting
+
+ZERO = Decimal("0")
+REFERENCE_ALPHABET = string.ascii_uppercase + string.digits
+
+
+class DepositError(Exception):
+    """Base class for deposit pipeline failures."""
+
+
+class InvalidTransition(DepositError):
+    """Raised when a deposit is moved into a state it cannot reach."""
+
+
+class KycRequired(DepositError):
+    """Raised when a client without approved KYC tries to deposit."""
+
+
+class AccountFrozen(DepositError):
+    """Raised when a frozen client tries to deposit."""
+
+
+#: Allowed state machine moves. Anything not listed here is rejected, which
+#: keeps a late or duplicated webhook from resurrecting a closed deposit.
+ALLOWED_TRANSITIONS = {
+    Deposit.Status.PENDING: {
+        Deposit.Status.DETECTED,
+        Deposit.Status.MANUAL_REVIEW,
+        Deposit.Status.REJECTED,
+        Deposit.Status.EXPIRED,
+    },
+    Deposit.Status.DETECTED: {
+        Deposit.Status.VERIFYING,
+        Deposit.Status.VERIFIED,
+        Deposit.Status.MANUAL_REVIEW,
+        Deposit.Status.REJECTED,
+    },
+    Deposit.Status.VERIFYING: {
+        Deposit.Status.VERIFIED,
+        Deposit.Status.MANUAL_REVIEW,
+        Deposit.Status.REJECTED,
+    },
+    Deposit.Status.VERIFIED: {
+        Deposit.Status.CREDITED,
+        Deposit.Status.MANUAL_REVIEW,
+        Deposit.Status.REJECTED,
+    },
+    Deposit.Status.CREDITED: {
+        Deposit.Status.RESERVED,
+        Deposit.Status.AVAILABLE,
+        Deposit.Status.MANUAL_REVIEW,
+        Deposit.Status.REVERSED,
+    },
+    Deposit.Status.RESERVED: {
+        Deposit.Status.AVAILABLE,
+        Deposit.Status.MANUAL_REVIEW,
+        Deposit.Status.REVERSED,
+    },
+    Deposit.Status.AVAILABLE: {
+        Deposit.Status.MANUAL_REVIEW,
+        Deposit.Status.REVERSED,
+    },
+    Deposit.Status.MANUAL_REVIEW: {
+        Deposit.Status.VERIFIED,
+        Deposit.Status.CREDITED,
+        Deposit.Status.AVAILABLE,
+        Deposit.Status.RESERVED,
+        Deposit.Status.REJECTED,
+        Deposit.Status.REVERSED,
+    },
+    Deposit.Status.REJECTED: {Deposit.Status.MANUAL_REVIEW},
+    Deposit.Status.REVERSED: set(),
+    # A late chain payment can still arrive after provider expiry; keep it in
+    # manual review rather than silently losing the receipt or auto-crediting.
+    Deposit.Status.EXPIRED: {Deposit.Status.MANUAL_REVIEW},
+}
+
+
+def transition(deposit: Deposit, new_status: str, *, reason: str = "") -> Deposit:
+    """Move a deposit to a new state, rejecting illegal moves."""
+    allowed = ALLOWED_TRANSITIONS.get(deposit.status, set())
+    if new_status not in allowed:
+        raise InvalidTransition(
+            f"Deposit {deposit.id} cannot move from {deposit.status} to {new_status}."
+        )
+    deposit.status = new_status
+    if reason:
+        deposit.review_reason = reason
+    deposit.updated_at = timezone.now()
+    deposit.save(update_fields=["status", "review_reason", "updated_at"])
+    return deposit
+
+
+def generate_reference() -> str:
+    """A short, unambiguous reference the client can put on a transfer."""
+    body = "".join(secrets.choice(REFERENCE_ALPHABET) for _ in range(10))
+    return f"VELT-{body}"
+
+
+def _kyc_profile(user: User):
+    from veltrix_app.services.kyc import ensure_profile
+
+    return ensure_profile(user)
+
+
+def _require_deposits_enabled() -> None:
+    if not getattr(settings, "FUNDING_DEPOSITS_ENABLED", False):
+        raise DepositError("Real deposits are not enabled on this deployment.")
+
+
+def _require_live_funding_enabled_for_direct_tron() -> None:
+    # Real direct-TRON deposits are mainnet only. Both live-verification
+    # attestations are mandatory; missing or false values fail closed.
+    if not getattr(settings, "FUNDING_LIVE_VERIFIED", False):
+        raise DepositError("Real deposits are not enabled on this deployment.")
+    if not getattr(settings, "TRON_LIVE_VERIFIED", False):
+        raise DepositError("Real deposits are not enabled on this deployment.")
+
+
+def _require_kyc(user: User) -> None:
+    if not getattr(settings, "FUNDING_REQUIRE_KYC", True):
+        return
+    profile = _kyc_profile(user)
+    if not profile.is_approved:
+        raise KycRequired("Identity verification is required before depositing.")
+
+
+def _require_not_frozen(user: User) -> None:
+    if user.funds_frozen:
+        raise AccountFrozen("This account is frozen. Contact support.")
+
+
+def _is_admin_actor(actor) -> bool:
+    return bool(
+        actor
+        and getattr(actor, "is_authenticated", False)
+        and getattr(actor, "is_active", False)
+        and getattr(actor, "is_admin", lambda: False)()
+    )
+
+
+MAX_STORED_AMOUNT = Decimal("100000000000000000000")
+
+
+def _validated_amount(amount: Decimal) -> Decimal:
+    """Normalise a client amount and reject values the ledger cannot store."""
+    try:
+        value = amount if isinstance(amount, Decimal) else Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise DepositError("Deposit amount is not a valid number.") from exc
+    if not value.is_finite() or value <= ZERO:
+        raise DepositError("Deposit amount must be a positive, finite number.")
+    if value >= MAX_STORED_AMOUNT:
+        raise DepositError("Deposit amount is too large.")
+    return value
+
+
+def _decimal_places(value: Decimal) -> int:
+    exponent = value.normalize().as_tuple().exponent
+    return max(0, -exponent)
+
+
+def _require_asset_precision(amount: Decimal, asset: Asset) -> None:
+    places = int(asset.decimals)
+    if places < 0 or _decimal_places(amount) > places:
+        raise DepositError(
+            f"Deposit amount for {asset.code} supports at most {places} decimal places."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Intent
+# ---------------------------------------------------------------------------
+
+@transaction.atomic
+def create_deposit_intent(
+    user: User,
+    provider: DepositProvider,
+    asset: Asset,
+    amount: Decimal,
+    *,
+    idempotency_key: str,
+    network: Network | None = None,
+) -> Deposit:
+    """Record the client's intent to deposit and produce the instructions.
+
+    Nothing is credited here. The intent only tells the client where to send
+    the money and gives the rail a stable reference to attribute it to.
+    """
+    # Serialize this user's intent creation. Besides refreshing a possibly
+    # stale frozen flag, the row lock makes concurrent retries with the same
+    # idempotency key observe the winner before calling an external provider.
+    user = User.objects.select_for_update().get(pk=user.pk)
+    _require_deposits_enabled()
+    if provider.code == "direct_tron":
+        _require_live_funding_enabled_for_direct_tron()
+    _require_kyc(user)
+    _require_not_frozen(user)
+    amount = _validated_amount(amount)
+
+    existing = Deposit.objects.filter(user=user, idempotency_key=idempotency_key).first()
+    if existing is not None:
+        existing_amount = existing.price_amount if provider.code == "nowpayments" else existing.expected_amount
+        if provider.code == "direct_tron":
+            crypto = getattr(existing, "crypto", None)
+            if crypto is not None and crypto.requested_amount is not None:
+                existing_amount = crypto.requested_amount
+        if (existing.provider_id != provider.id or existing.asset_id != asset.id
+                or existing_amount != amount
+                or (network is not None and (not hasattr(existing, "crypto") or existing.crypto.network_id != network.id))):
+            raise DepositError("This idempotency key was already used for a different deposit request.")
+        if existing.provider_creation_uncertain:
+            raise DepositError("A prior NOWPayments payment creation is unresolved. Reconcile it before requesting another deposit.")
+        if provider.code == "nowpayments" and validate_nowpayments_quote(existing):
+            raise DepositError("This NOWPayments quote expired or changed. Request a new quote.")
+        return existing
+
+    provider_assets = list(provider.supported_assets.all())
+    if provider_assets and asset not in provider_assets:
+        raise DepositError(f"Provider {provider.code} does not accept {asset.code}.")
+    if provider.code in ("nowpayments", "direct_tron") or provider.rail == Deposit.Rail.BANK:
+        _require_asset_precision(amount, asset)
+
+    if provider.code == "nowpayments":
+        if Deposit.objects.filter(user=user, provider=provider, provider_creation_uncertain=True).exists():
+            raise DepositError("A prior NOWPayments payment creation is unresolved. Reconcile it before requesting another deposit.")
+        # Provider/network minimums are denominated in the quoted crypto asset,
+        # while this request is a USD notional. Do not compare unlike units.
+        # NOWPayments will reject a below-minimum payment during creation.
+        if provider.fee_percent or provider.fee_fixed:
+            raise DepositError(
+                "NOWPayments Veltrix fees are unavailable until a separate fee collection flow is approved."
+            )
+    else:
+        if provider.min_deposit and amount < provider.min_deposit:
+            raise DepositError(f"Minimum deposit for {provider.code} is {provider.min_deposit} {asset.code}.")
+        if provider.max_deposit and amount > provider.max_deposit:
+            raise DepositError(f"Maximum deposit for {provider.code} is {provider.max_deposit} {asset.code}.")
+        if network is not None and network.min_deposit and amount < network.min_deposit:
+            raise DepositError(f"Minimum deposit for {network.chain} is {network.min_deposit} {asset.code}.")
+
+    deposit = Deposit.objects.create(
+        user=user,
+        rail=provider.rail,
+        asset=asset,
+        provider=provider,
+        expected_amount=amount,
+        price_amount=amount if provider.code == "nowpayments" else None,
+        price_currency="usd" if provider.code == "nowpayments" else "",
+        idempotency_key=idempotency_key,
+        reference=generate_reference(),
+        provider_ref=generate_reference(),
+        fee_amount=(ZERO if provider.code == "nowpayments" else
+            Decimal(str(provider.fee_percent)) / Decimal("100") * amount
+            + Decimal(str(provider.fee_fixed))),
+    )
+
+    if provider.rail == Deposit.Rail.BANK:
+        _create_bank_intent(deposit)
+    elif provider.rail == Deposit.Rail.CRYPTO:
+        if network is None:
+            raise DepositError("A crypto deposit needs a network.")
+        _create_crypto_intent(deposit, network)
+    elif provider.rail == Deposit.Rail.CARD:
+        _create_card_intent(deposit)
+
+    AuditLog.objects.create(
+        user=user,
+        actor=user,
+        action="deposit.intent_created",
+        details=f"deposit={deposit.id} rail={deposit.rail} asset={deposit.asset_id} amount={amount}",
+    )
+    try:
+        subject = f"Deposit request - {deposit.reference}"
+        conversation = Conversation.objects.filter(user=user, is_active=True).order_by("-updated_at").first()
+        if conversation is None:
+            conversation = Conversation.objects.create(
+                user=user,
+                subject=subject,
+            )
+        else:
+            if not conversation.subject or conversation.subject == "General Support":
+                conversation.subject = subject
+                conversation.updated_at = timezone.now()
+                conversation.save(update_fields=["subject", "updated_at"])
+            else:
+                conversation.updated_at = timezone.now()
+                conversation.save(update_fields=["updated_at"])
+        network_info = ""
+        network_str = ""
+        try:
+            if getattr(deposit, "rail", None) == Deposit.Rail.CRYPTO:
+                crypto = getattr(deposit, "crypto", None)
+                if crypto and getattr(crypto, "network", None):
+                    network_str = f"{crypto.network.chain} ({getattr(crypto.network, 'token_standard', '')})"
+                    network_info = f"Network: {network_str}\n"
+        except Exception:
+            network_info = ""
+            network_str = ""
+        message_content = (
+            f"New deposit request\n"
+            f"Client: {getattr(user, 'email', None) or user.username} (ID: {user.id})\n"
+            f"Deposit ID: {deposit.id}\n"
+            f"Reference: {deposit.reference}\n"
+            f"Rail: {deposit.rail}\n"
+            f"Provider: {deposit.provider.code}\n"
+            f"Asset: {deposit.asset.code}\n"
+            f"{network_info}"
+            f"Amount: {amount}\n"
+        )
+        if not Message.objects.filter(conversation=conversation, content=message_content).exists():
+            Message.objects.create(
+                conversation=conversation,
+                sender=user,
+                content=message_content,
+            )
+        try:
+            admin_emails = []
+            support_emails = getattr(settings, "SUPPORT_ADMIN_EMAILS", []) or []
+            if support_emails:
+                admin_emails = list(support_emails)
+            else:
+                admin_emails = list(
+                    User.objects.filter(is_active=True)
+                    .filter(models.Q(is_staff=True) | models.Q(role=User.Role.ADMIN))
+                    .exclude(email="")
+                    .values_list("email", flat=True)
+                )
+            if admin_emails:
+                email_subject = f"Veltrix deposit request {deposit.reference}"
+                email_body = (
+                    f"New deposit request\n\n"
+                    f"Client: {getattr(user, 'email', None) or user.username} (ID: {user.id})\n"
+                    f"Deposit ID: {deposit.id}\n"
+                    f"Reference: {deposit.reference}\n"
+                    f"Rail: {deposit.rail}\n"
+                    f"Provider: {deposit.provider.code}\n"
+                    f"Asset: {deposit.asset.code}\n"
+                    f"Network: {network_str or 'N/A'}\n"
+                    f"Requested amount: {amount}\n"
+                )
+                send_mail(email_subject, email_body, getattr(settings, "DEFAULT_FROM_EMAIL", None) or "noreply@veltrix.com", list(set(admin_emails)), fail_silently=True)
+        except Exception:
+            pass
+    except Exception:
+        # Never fail deposit intent creation due to notification issues
+        pass
+    return deposit
+
+
+def _create_bank_intent(deposit: Deposit) -> None:
+    """Create a manual bank-transfer request.
+
+    ``bank_manual`` deliberately contains no account details in the app: an
+    operator provides verified instructions through the support channel. This
+    prevents the application from inventing or leaking collection-account
+    details. Legacy bank providers keep their existing collection-account
+    behaviour.
+    """
+    if deposit.provider.code == "bank_manual":
+        if not getattr(settings, "BANK_TRANSFERS_ENABLED", False):
+            raise DepositError("Bank transfers are not enabled on this deployment.")
+        configured_currency = str(getattr(settings, "BANK_TRANSFER_CURRENCY", "") or "").upper()
+        if not configured_currency:
+            raise DepositError("Bank transfers are unavailable until a settlement currency is configured.")
+        if deposit.asset.code.upper() != configured_currency:
+            raise DepositError(f"Bank transfers are only available in {configured_currency}.")
+        deposit.reference = deposit.provider_ref
+        bank = BankDeposit.objects.create(deposit=deposit, provider_reference=deposit.reference)
+        deposit.instructions = {
+            "method": "bank_transfer",
+            "reference": deposit.reference,
+            "amount": str(deposit.expected_amount),
+            "currency": deposit.asset.code,
+            "message": (
+                "Use the Veltrix support channel to request verified bank-transfer "
+                "instructions before sending funds. Quote the reference above. "
+                "Do not send money to details from any other source."
+            ),
+            "account_details_provided": False,
+            "status": "awaiting_client_transfer",
+        }
+        deposit.save(update_fields=["reference", "instructions"])
+        return
+    collection = getattr(settings, "FUNDING_COLLECTION_ACCOUNT", {}) or {}
+    deposit.reference = deposit.provider_ref
+    bank = BankDeposit.objects.create(
+        deposit=deposit,
+        provider_reference=deposit.reference,
+        provider_account=collection.get("account_number", ""),
+    )
+    deposit.instructions = {
+        "bank_name": collection.get("bank_name", ""),
+        "account_number": collection.get("account_number", ""),
+        "account_name": collection.get("account_name", ""),
+        "reference": deposit.reference,
+        "amount": str(deposit.expected_amount),
+        "currency": deposit.asset.code,
+        "note": collection.get("note", ""),
+    }
+    deposit.save(update_fields=["reference", "instructions"])
+    bank.save(update_fields=["provider_account"])
+
+
+def _unique_payable_amount(network: Network, requested: Decimal) -> tuple[Decimal, int]:
+    """Add a small, deterministic-ish micro-USDT suffix that is not in use.
+
+    The requested amount is never silently changed: the suffix is shown to the
+    client as the exact amount to send. Suffixes are never recycled, including
+    after a request expires, because a late on-chain payment must not be
+    attributed to a newer customer who happens to receive the same amount.
+    """
+    # Serialise allocation for this network. Without this lock two concurrent
+    # requests can both observe the same "unused" suffix before either saves.
+    Network.objects.select_for_update().get(pk=network.pk)
+    used = set(
+        CryptoDeposit.objects.filter(
+            network=network,
+            deposit__provider__code="direct_tron",
+            payable_amount__isnull=False,
+        ).values_list("payable_amount", flat=True)
+    )
+    quantum = Decimal("0.000001")
+    for suffix in range(1, 1000):
+        candidate = requested + (Decimal(suffix) * quantum)
+        if candidate not in used:
+            return candidate, suffix
+    raise DepositError("Could not allocate a unique payable amount. Please try again.")
+
+
+def _create_crypto_intent(deposit: Deposit, network: Network) -> None:
+    """Create provider-issued instructions; never invent a wallet address."""
+    if (deposit.asset.code != "USDT" or network.chain.upper() not in ("TRON", "TRON MAINNET")
+            or network.token_standard.upper() != "TRC20"
+            or (network.is_testnet and deposit.provider.code != "direct_tron") or not network.is_active):
+        raise DepositError("Only an active USDT TRC20 network is supported.")
+    crypto = CryptoDeposit.objects.create(deposit=deposit, network=network, address="",
+        required_confirmations=network.required_confirmations)
+    if deposit.provider.code == "direct_tron":
+        from veltrix_app.services.tron import (
+            TronConfigurationError, public_tron_configuration,
+            require_tron_chain_configuration, validate_tron_network,
+        )
+        try:
+            if not getattr(settings, "TRON_DEPOSITS_ENABLED", False):
+                raise DepositError("Direct TRON deposits are not enabled on this deployment.")
+            live = not network.is_testnet
+            require_tron_chain_configuration(live=live)
+            validate_tron_network(network, live=live)
+            public = public_tron_configuration()
+            min_amount = Decimal(public["min_amount"]) if public["min_amount"] else None
+            max_amount = Decimal(public["max_amount"]) if public["max_amount"] else None
+            if min_amount is not None and deposit.expected_amount < min_amount:
+                raise DepositError(f"Minimum direct TRON deposit is {min_amount} USDT.")
+            if max_amount is not None and deposit.expected_amount > max_amount:
+                raise DepositError(f"Maximum direct TRON deposit is {max_amount} USDT.")
+            requested = deposit.expected_amount
+            payable = requested
+            suffix = 0
+            if settings.TRON_UNIQUE_AMOUNT_ENABLED:
+                payable, suffix = _unique_payable_amount(network, requested)
+                deposit.expected_amount = payable
+                deposit.save(update_fields=["expected_amount"])
+            expires_at = None
+            if settings.TRON_REQUEST_TTL_MINUTES:
+                expires_at = timezone.now() + timedelta(minutes=settings.TRON_REQUEST_TTL_MINUTES)
+            crypto.address = public["address"]
+            crypto.requested_amount = requested
+            crypto.payable_amount = payable
+            crypto.unique_amount_suffix = suffix
+            crypto.expires_at = expires_at
+            crypto.save(update_fields=[
+                "address", "requested_amount", "payable_amount",
+                "unique_amount_suffix", "expires_at",
+            ])
+            deposit.instructions = {
+                "method": "crypto",
+                "network": "TRON (TRC20)",
+                "asset": "USDT",
+                "address": public["address"],
+                "contract_address": public["contract_address"],
+                "amount": str(payable),
+                "exact_amount_required": True,
+                "expires_at": expires_at.isoformat() if expires_at else "",
+                "note": (
+                    "Send USDT using the TRC20 network only to this shared address. "
+                    "The exact amount identifies your request; do not round it. "
+                    "Transfers are independently detected and only credited after "
+                    "verification and confirmations."
+                ),
+                "reference": deposit.reference,
+            }
+            deposit.save(update_fields=["instructions"])
+        except TronConfigurationError as exc:
+            # Do not leak infrastructure detail, but fail closed.
+            raise DepositError(f"Direct TRON deposits are unavailable: {exc}") from exc
+        return
+    if deposit.provider.code != "nowpayments":
+        raise DepositError("No crypto deposit provider is configured.")
+    from veltrix_app.services.adapters import get_adapter
+    # Make the selected chain available to the adapter while it validates the
+    # provider quote; the outer transaction rolls this row back on any failure.
+    from veltrix_app.services.adapters import PaymentCreationUncertain
+    try:
+        instructions = get_adapter(deposit.provider).create_intent(deposit)
+    except PaymentCreationUncertain as exc:
+        deposit.provider_ref = exc.provider_ref
+        deposit.provider_creation_uncertain = True
+        deposit.instructions = {
+            "provider": "NOWPayments",
+            "order_id": deposit.reference,
+            "message": "Payment creation could not be confirmed. Do not submit another deposit until support reconciles this reference.",
+        }
+        send_to_manual_review(
+            deposit,
+            reason=f"NOWPayments payment creation is uncertain; reconcile order reference {deposit.reference} before retrying.",
+        )
+        deposit.save(update_fields=["provider_ref", "provider_creation_uncertain", "instructions", "updated_at"])
+        return
+    crypto.address = instructions["address"]
+    crypto.save(update_fields=["address"])
+    deposit.instructions = instructions
+    deposit.save(update_fields=["instructions"])
+
+
+def _create_card_intent(deposit: Deposit) -> None:
+    """A card deposit is started at the provider's hosted checkout.
+
+    Veltrix never sees the card number: the client is handed a session to
+    complete at the payment provider.
+    """
+    card = CardDeposit.objects.create(deposit=deposit)
+    deposit.instructions = {
+        "provider": deposit.provider.code,
+        "psp_session_id": card.psp_session_id,
+        "amount": str(deposit.expected_amount),
+        "currency": deposit.asset.code,
+        "note": "Complete the payment on the provider's secure checkout page.",
+    }
+    deposit.save(update_fields=["instructions"])
+
+
+# ---------------------------------------------------------------------------
+# Detection and verification
+# ---------------------------------------------------------------------------
+
+@transaction.atomic
+def mark_detected(
+    deposit: Deposit,
+    *,
+    amount: Decimal | None = None,
+    provider_ref: str | None = None,
+    actor: User | None = None,
+) -> Deposit:
+    """Record that the money has been seen on the rail."""
+    if deposit.is_credited:
+        return deposit
+    if amount is not None:
+        deposit.received_amount = amount
+    if provider_ref:
+        deposit.provider_ref = provider_ref
+    deposit.updated_at = timezone.now()
+    deposit.save(update_fields=["received_amount", "provider_ref", "updated_at"])
+    if deposit.status == Deposit.Status.PENDING:
+        transition(deposit, Deposit.Status.DETECTED)
+    AuditLog.objects.create(
+        user=deposit.user,
+        actor=actor,
+        action="deposit.detected",
+        details=f"deposit={deposit.id} amount={deposit.received_amount}",
+    )
+    return deposit
+
+
+@transaction.atomic
+def verify_deposit(deposit: Deposit, *, actor: User | None = None, reason: str = "") -> Deposit:
+    """Move a detected deposit through verification to verified."""
+    if deposit.status == Deposit.Status.VERIFIED:
+        return deposit
+    if deposit.status == Deposit.Status.DETECTED:
+        transition(deposit, Deposit.Status.VERIFYING)
+    if deposit.status == Deposit.Status.VERIFYING:
+        transition(deposit, Deposit.Status.VERIFIED)
+    if reason:
+        deposit.review_reason = reason
+        deposit.save(update_fields=["review_reason"])
+    AuditLog.objects.create(
+        user=deposit.user,
+        actor=actor,
+        action="deposit.verified",
+        details=f"deposit={deposit.id}",
+    )
+    return deposit
+
+
+@transaction.atomic
+def send_to_manual_review(deposit: Deposit, *, reason: str, actor: User | None = None) -> Deposit:
+    """Park a deposit for a human to look at.
+
+    Nothing is credited and nothing is rejected: a review is the safe default
+    whenever the automated checks do not line up.
+    """
+    if deposit.status == Deposit.Status.REVERSED:
+        raise InvalidTransition(f"Deposit {deposit.id} is closed ({deposit.status}).")
+    if deposit.status != Deposit.Status.MANUAL_REVIEW:
+        transition(deposit, Deposit.Status.MANUAL_REVIEW, reason=reason)
+    AuditLog.objects.create(
+        user=deposit.user,
+        actor=actor,
+        action="deposit.manual_review",
+        details=f"deposit={deposit.id} reason={reason}",
+    )
+    return deposit
+
+
+def validate_nowpayments_quote(deposit: Deposit, *, now=None, require_confirmed=False) -> str | None:
+    """Return a safe reason if the persisted USD-to-USDT payment quote is unusable."""
+    now = now or timezone.now()
+    crypto = getattr(deposit, "crypto", None)
+    instructions = deposit.instructions or {}
+    try:
+        instruction_price = Decimal(str(instructions.get("price_amount")))
+        instruction_amount = Decimal(str(instructions.get("amount")))
+    except (InvalidOperation, TypeError, ValueError):
+        return "The payment quote is expired or its stored amount, currency, network, or provider reference changed."
+    if (deposit.provider.code != "nowpayments" or (require_confirmed and not deposit.quote_confirmed_at)
+            or deposit.price_amount is None
+            or deposit.price_amount <= ZERO or deposit.price_currency.lower() != "usd"
+            or deposit.quoted_amount is None or deposit.quoted_amount <= ZERO
+            or deposit.quoted_currency.lower() != "usdttrc20"
+            or deposit.expected_amount != deposit.quoted_amount
+            or (deposit.network_precision is not None and
+                deposit.quoted_amount != deposit.quoted_amount.quantize(Decimal(1).scaleb(-deposit.network_precision)))
+            or deposit.quoted_network.lower() != "tron (trc20)"
+            or not deposit.provider_ref or deposit.quote_expires_at is None
+            or not timezone.is_aware(deposit.quote_expires_at)
+            or (not deposit.quote_confirmed_at and deposit.quote_expires_at <= now)
+            or instruction_price != deposit.price_amount
+            or str(instructions.get("price_currency", "")).lower() != "usd"
+            or instruction_amount != deposit.quoted_amount
+            or str(instructions.get("currency", "")).upper() != "USDT"
+            or not crypto or crypto.network.chain.upper() != "TRON"
+            or crypto.network.token_standard.upper() != "TRC20"
+            or crypto.network.is_testnet):
+        return "The payment quote is expired or its stored amount, currency, network, or provider reference changed."
+    return None
+
+
+def check_amount(deposit: Deposit) -> str | None:
+    """Compare what arrived against what was expected.
+
+    Returns ``None`` when the amounts are acceptable, otherwise a short
+    reason describing the problem.
+    """
+    received = deposit.received_amount
+    if received is None:
+        return "No amount received yet."
+    tolerance = Decimal(str(getattr(settings, "FUNDING_UNDERPAY_TOLERANCE_PERCENT", "1")))
+    floor = (deposit.expected_amount * (Decimal("100") - tolerance) / Decimal("100")).quantize(
+        Decimal("0.000000000000000001"), rounding=ROUND_HALF_UP
+    )
+    if received < floor:
+        return f"Underpaid: expected {deposit.expected_amount}, received {received}."
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Credit
+# ---------------------------------------------------------------------------
+
+@transaction.atomic
+def credit_deposit(
+    deposit: Deposit, *, actor: User | None = None, allow_amount_mismatch: bool = False
+) -> Deposit:
+    """Credit a verified deposit to the client's ledger balance.
+
+    This is the only place client money is created on the ledger, and it is
+    idempotent: calling it twice for the same deposit posts once.
+    """
+    # Re-read under a row lock so two concurrent settlements cannot both
+    # observe ``is_credited=False`` and race into the ledger.
+    deposit = Deposit.objects.select_for_update().select_related(
+        "asset", "provider", "user"
+    ).get(pk=deposit.pk)
+    if deposit.is_credited:
+        return deposit
+    if deposit.provider.code == "nowpayments" and (deposit.fee_amount or ZERO) != ZERO:
+        raise DepositError("NOWPayments Veltrix fees cannot be deducted from settlement.")
+    if deposit.status not in (Deposit.Status.VERIFIED, Deposit.Status.MANUAL_REVIEW):
+        raise InvalidTransition(
+            f"Deposit {deposit.id} must be verified before it can be credited (is {deposit.status})."
+        )
+
+    if allow_amount_mismatch:
+        allowed_rails = (Deposit.Rail.BANK, Deposit.Rail.CRYPTO)
+        if deposit.rail not in allowed_rails:
+            raise DepositError("Amount mismatch overrides are not allowed for this rail.")
+        if deposit.rail == Deposit.Rail.CRYPTO and deposit.provider.code != "direct_tron":
+            raise DepositError("Crypto amount overrides are only allowed for verified direct TRON transfers.")
+        if deposit.received_amount is None or deposit.received_amount <= ZERO:
+            raise DepositError("A verified positive amount is required.")
+    else:
+        problem = check_amount(deposit)
+        if problem:
+            raise DepositError(problem)
+
+    gross = deposit.received_amount or deposit.expected_amount
+    fee = deposit.fee_amount or ZERO
+    net = gross - fee
+    if net <= ZERO:
+        raise DepositError("The deposit amount does not cover the fee.")
+
+    asset = deposit.asset
+    customer = ledger.customer_account(asset, deposit.user)
+    fee_account = ledger.fee_revenue_account(asset)
+
+    postings = []
+    if deposit.rail == Deposit.Rail.CARD:
+        # The money is sitting at the payment provider until it settles, so it
+        # lands in the in-transit account and moves to treasury on settlement.
+        postings.append(
+            Posting(account=ledger.deposits_in_transit_account(asset), side="D", amount=gross)
+        )
+    else:
+        postings.append(Posting(account=ledger.treasury_account(asset), side="D", amount=gross))
+
+    bucket = "reserved" if deposit.provider.reserve_days else "available"
+    postings.append(Posting(account=customer, side="C", amount=net, bucket=bucket))
+    if fee > ZERO:
+        postings.append(Posting(account=fee_account, side="C", amount=fee))
+
+    entry = ledger.record_entry(
+        reference_type=LedgerEntry.ReferenceType.DEPOSIT,
+        reference_id=str(deposit.id),
+        postings=postings,
+        asset=asset,
+        note=f"Deposit {deposit.id} credited",
+        actor=actor,
+    )
+
+    deposit.ledger_entry = entry
+    deposit.credited_at = timezone.now()
+    deposit.received_amount = gross
+    deposit.reserved_amount = net if bucket == "reserved" else ZERO
+    deposit.updated_at = timezone.now()
+
+    if deposit.provider.reserve_days:
+        deposit.available_at = deposit.credited_at + timedelta(days=deposit.provider.reserve_days)
+        deposit.status = Deposit.Status.CREDITED
+        deposit.save(
+            update_fields=[
+                "ledger_entry",
+                "credited_at",
+                "available_at",
+                "received_amount",
+                "reserved_amount",
+                "status",
+                "updated_at",
+            ]
+        )
+        transition(deposit, Deposit.Status.RESERVED)
+    else:
+        deposit.available_at = deposit.credited_at
+        deposit.status = Deposit.Status.CREDITED
+        deposit.save(
+            update_fields=[
+                "ledger_entry",
+                "credited_at",
+                "available_at",
+                "received_amount",
+                "reserved_amount",
+                "status",
+                "updated_at",
+            ]
+        )
+        transition(deposit, Deposit.Status.AVAILABLE)
+
+    ledger.assert_balance_consistent(deposit.user, deposit.asset)
+
+    AuditLog.objects.create(
+        user=deposit.user,
+        actor=actor,
+        action="deposit.credited",
+        details=(
+            f"deposit={deposit.id} gross={gross} fee={fee} net={net} "
+            f"asset={asset.code} bucket={bucket} entry={entry.id}"
+        ),
+    )
+    return deposit
+
+
+@transaction.atomic
+def release_reserve(deposit: Deposit, *, actor: User | None = None) -> Deposit:
+    """Move a card deposit out of the reserve window and into the balance.
+
+    The money was already on the ledger when the deposit was credited, so this
+    only moves it between the reserved and available slices of the cached
+    balance. No ledger entry is written.
+    """
+    if deposit.status != Deposit.Status.RESERVED:
+        return deposit
+    if deposit.available_at and deposit.available_at > timezone.now():
+        return deposit
+
+    card = getattr(deposit, "card", None)
+    if card is not None and card.dispute_status == CardDeposit.DisputeStatus.OPEN:
+        return deposit
+
+    ledger.move_reserved_to_available(deposit.user, deposit.asset, deposit.net_amount)
+    transition(deposit, Deposit.Status.AVAILABLE)
+    deposit.updated_at = timezone.now()
+    deposit.save(update_fields=["updated_at"])
+    AuditLog.objects.create(
+        user=deposit.user,
+        actor=actor,
+        action="deposit.reserve_released",
+        details=f"deposit={deposit.id} amount={deposit.net_amount}",
+    )
+    return deposit
+
+
+# ---------------------------------------------------------------------------
+# Reversal
+# ---------------------------------------------------------------------------
+
+@transaction.atomic
+def reverse_deposit(
+    deposit: Deposit,
+    *,
+    reason: str,
+    actor: User | None = None,
+    freeze: bool = False,
+) -> Deposit:
+    """Undo a credited deposit as one locked, auditable operation.
+
+    A spent deposit may leave a negative ledger balance because this model has
+    no debt or recovery policy. In that case the account is frozen and the
+    deficit is explicitly audited in the same transaction as the reversal.
+    Any database failure rolls back the posting, state transition, freeze, and
+    audit records together.
+    """
+    # Lock the state row so concurrent retries cannot independently process a
+    # stale caller instance. The ledger reversal reference is an additional
+    # idempotency guard.
+    deposit = Deposit.objects.select_for_update().get(pk=deposit.pk)
+    if deposit.status == Deposit.Status.REVERSED:
+        return deposit
+    if not deposit.is_credited:
+        raise InvalidTransition(f"Deposit {deposit.id} has not been credited.")
+    if deposit.ledger_entry_id is None:
+        raise DepositError(f"Deposit {deposit.id} has no ledger entry to reverse.")
+
+    original = deposit.ledger_entry
+    customer_credits = sum(
+        (posting.amount for posting in original.postings.select_related("account").all()
+         if posting.account.is_customer_account and posting.side == "C"),
+        ZERO,
+    )
+    AssetBalance.objects.select_for_update().get(
+        user_id=deposit.user_id, asset_id=deposit.asset_id
+    )
+    current_total = ledger.ledger_balance(deposit.user, deposit.asset)
+    deficit = max(ZERO, customer_credits - current_total)
+    should_freeze = freeze or deficit > ZERO
+
+    if should_freeze:
+        locked_user = User.objects.select_for_update().get(pk=deposit.user_id)
+        if not locked_user.funds_frozen:
+            locked_user.funds_frozen = True
+            locked_user.save(update_fields=["funds_frozen"])
+        deposit.user = locked_user
+    if deficit > ZERO:
+        AuditLog.objects.create(
+            user=deposit.user,
+            actor=actor,
+            action="deposit.reversal_deficit",
+            details=(
+                f"deposit={deposit.id} asset={deposit.asset.code} "
+                f"balance_before={current_total} reversal_amount={customer_credits} "
+                f"projected_deficit={deficit}; account frozen; reason={reason}"
+            ),
+        )
+
+    ledger.reverse_entry(original, reference_id=f"rev-{deposit.id}", reason=reason, actor=actor)
+
+    if deposit.rail == Deposit.Rail.CARD:
+        card = getattr(deposit, "card", None)
+        if card is not None:
+            card.dispute_status = CardDeposit.DisputeStatus.LOST
+            card.dispute_amount = deposit.net_amount
+            card.save(update_fields=["dispute_status", "dispute_amount"])
+    bank = getattr(deposit, "bank", None)
+    if bank is not None:
+        bank.reversed_at = timezone.now()
+        bank.save(update_fields=["reversed_at"])
+
+    deposit.review_reason = reason
+    deposit.updated_at = timezone.now()
+    deposit.save(update_fields=["review_reason", "updated_at"])
+    transition(deposit, Deposit.Status.REVERSED)
+
+    AuditLog.objects.create(
+        user=deposit.user,
+        actor=actor,
+        action="deposit.reversed",
+        details=f"deposit={deposit.id} reason={reason} frozen={should_freeze} deficit={deficit}",
+    )
+    return deposit
+
+
+@transaction.atomic
+def settle_card_deposit(deposit: Deposit, *, actor: User | None = None) -> Deposit:
+    """Move a captured card payment from in-transit into the treasury."""
+    if deposit.rail != Deposit.Rail.CARD or not deposit.is_credited:
+        return deposit
+    card = getattr(deposit, "card", None)
+    if card is None or card.settled_at is not None:
+        return deposit
+
+    asset = deposit.asset
+    gross = deposit.received_amount or deposit.expected_amount
+    postings = [
+        Posting(account=ledger.treasury_account(asset), side="D", amount=gross),
+        Posting(account=ledger.deposits_in_transit_account(asset), side="C", amount=gross),
+    ]
+    ledger.record_entry(
+        reference_type=LedgerEntry.ReferenceType.DEPOSIT,
+        reference_id=f"settle-{deposit.id}",
+        postings=postings,
+        asset=asset,
+        note=f"Card deposit {deposit.id} settled",
+        actor=actor,
+    )
+    card.settled_at = timezone.now()
+    card.save(update_fields=["settled_at"])
+    return deposit
+
+
+# ---------------------------------------------------------------------------
+# Manual bank review
+# ---------------------------------------------------------------------------
+
+@transaction.atomic
+def approve_bank_transfer(
+    deposit_id: int,
+    *,
+    actor: User,
+    amount: Decimal,
+    currency: str,
+    reference: str,
+    verification_source: str,
+    reason: str,
+) -> Deposit:
+    """Record independent bank verification and credit the received amount once.
+
+    The amount may differ from the client's request, but the operator must
+    explicitly supply the verified amount, reference and source. The ledger
+    always records the actual verified amount, never the requested amount.
+    """
+    if not _is_admin_actor(actor):
+        raise DepositError("An administrator actor is required.")
+    amount = _validated_amount(amount)
+    if not str(reference or "").strip():
+        raise DepositError("The verified bank reference is required.")
+    if not str(verification_source or "").strip():
+        raise DepositError("The independent verification source is required.")
+    deposit = Deposit.objects.select_for_update().select_related(
+        "asset", "provider", "user"
+    ).get(pk=deposit_id)
+    if deposit.rail != Deposit.Rail.BANK:
+        raise DepositError("Only bank deposits can be approved through this workflow.")
+    _require_asset_precision(amount, deposit.asset)
+    bank = BankDeposit.objects.select_for_update().get(deposit=deposit)
+    if deposit.is_credited or deposit.status == Deposit.Status.CREDITED:
+        return deposit
+    _require_deposits_enabled()
+    if deposit.status in (
+        Deposit.Status.REVERSED, Deposit.Status.REJECTED, Deposit.Status.EXPIRED,
+    ):
+        raise InvalidTransition(f"Deposit {deposit.id} cannot be approved from {deposit.status}.")
+    expected_currency = deposit.asset.code.upper()
+    if str(currency or "").strip().upper() != expected_currency:
+        raise DepositError(f"Verified currency must be {expected_currency}.")
+    if str(reference).strip().upper() != bank.provider_reference.upper():
+        raise DepositError("Verified reference does not match this deposit request.")
+    deposit.received_amount = amount
+    if deposit.status == Deposit.Status.PENDING:
+        mark_detected(deposit, amount=deposit.received_amount, actor=actor)
+    else:
+        deposit.updated_at = timezone.now()
+        deposit.save(update_fields=["received_amount", "updated_at"])
+    if deposit.status not in (Deposit.Status.VERIFIED, Deposit.Status.MANUAL_REVIEW):
+        verify_deposit(deposit, actor=actor, reason=str(reason or "Bank receipt independently verified."))
+    bank.verified_amount = amount
+    bank.verified_currency = expected_currency
+    bank.verified_reference = str(reference).strip()
+    bank.verification_source = str(verification_source).strip()[:255]
+    bank.decision_reason = str(reason or "")
+    bank.approved_by = actor
+    bank.approved_at = timezone.now()
+    bank.settled_at = bank.approved_at
+    bank.save(update_fields=[
+        "verified_amount", "verified_currency", "verified_reference",
+        "verification_source", "decision_reason", "approved_by",
+        "approved_at", "settled_at",
+    ])
+    deposit.review_reason = str(reason or deposit.review_reason)[:255]
+    deposit.save(update_fields=["review_reason", "updated_at"])
+    deposit = credit_deposit(deposit, actor=actor, allow_amount_mismatch=True)
+    AuditLog.objects.create(
+        user=deposit.user,
+        actor=actor,
+        action="deposit.bank_approved",
+        details=(
+            f"deposit={deposit.id} verified_amount={amount} currency={expected_currency} "
+            f"source={bank.verification_source} reason={str(reason or '')[:500]}"
+        ),
+    )
+    return deposit
+
+
+@transaction.atomic
+def reject_bank_transfer(deposit_id: int, *, actor: User, reason: str) -> Deposit:
+    """Reject an uncredited bank request with an auditable reason."""
+    if not _is_admin_actor(actor):
+        raise DepositError("An administrator actor is required.")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise DepositError("A rejection reason is required.")
+    deposit = Deposit.objects.select_for_update().get(pk=deposit_id)
+    if deposit.rail != Deposit.Rail.BANK:
+        raise DepositError("Only bank deposits can be rejected through this workflow.")
+    if deposit.is_credited or deposit.status in (
+        Deposit.Status.CREDITED, Deposit.Status.AVAILABLE, Deposit.Status.RESERVED,
+        Deposit.Status.REVERSED,
+    ):
+        raise InvalidTransition("A credited deposit cannot be rejected; use the reversal workflow.")
+    bank = BankDeposit.objects.select_for_update().get(deposit=deposit)
+    if deposit.status == Deposit.Status.EXPIRED:
+        transition(deposit, Deposit.Status.MANUAL_REVIEW, reason="Operator review before rejection.")
+    if deposit.status != Deposit.Status.REJECTED:
+        transition(deposit, Deposit.Status.REJECTED, reason=reason)
+    bank.decision_reason = reason
+    bank.rejected_by = actor
+    bank.rejected_at = timezone.now()
+    bank.save(update_fields=["decision_reason", "rejected_by", "rejected_at"])
+    AuditLog.objects.create(
+        user=deposit.user,
+        actor=actor,
+        action="deposit.bank_rejected",
+        details=f"deposit={deposit.id} reason={reason[:500]}",
+    )
+    return deposit

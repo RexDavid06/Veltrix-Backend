@@ -23,6 +23,15 @@ from .views import (
     WatchlistAPIView,
     WatchlistDetailAPIView,
 )
+from .deposits import (
+    BankDepositCreateAPIView,
+    DepositConfigAPIView,
+    DepositDetailAPIView,
+    DepositListCreateAPIView,
+    DepositQuoteConfirmAPIView,
+    DepositTxidAPIView,
+    NowPaymentsWebhookAPIView,
+)
 from .verify import (
     PasswordResetConfirmAPIView,
     PasswordResetRequestAPIView,
@@ -42,6 +51,15 @@ urlpatterns = [
     path("support/", SupportTicketAPIView.as_view(), name="api_support"),
     path("health/", HealthAPIView.as_view(), name="api_health"),
     path("market/", MarketAPIView.as_view(), name="api_market"),
+
+    path("deposits/", DepositListCreateAPIView.as_view(), name="api_deposits"),
+    path("deposits/config/", DepositConfigAPIView.as_view(), name="api_deposit_config"),
+    path("deposits/config", DepositConfigAPIView.as_view(), name="api_deposit_config_noslash"),
+    path("deposits/bank/", BankDepositCreateAPIView.as_view(), name="api_bank_deposit_create"),
+    path("deposits/<int:pk>/", DepositDetailAPIView.as_view(), name="api_deposit_detail"),
+    path("deposits/<int:pk>/txid/", DepositTxidAPIView.as_view(), name="api_deposit_txid"),
+    path("deposits/<int:pk>/confirm/", DepositQuoteConfirmAPIView.as_view(), name="api_deposit_quote_confirm"),
+    path("webhooks/nowpayments/", NowPaymentsWebhookAPIView.as_view(), name="api_nowpayments_webhook"),
 
     # Demo trading, funding, and watchlist
     path("watchlist/", WatchlistAPIView.as_view(), name="api_watchlist"),
@@ -68,34 +86,4 @@ urlpatterns = [
 
     # Admin dashboard API (every endpoint is guarded by IsPlatformAdmin)
     path("admin/", include("veltrix_app.api.admin_urls")),
-]
-
-from .deposits import DepositListCreateView, DepositConfigView
-urlpatterns += [
-    path("deposits/", DepositListCreateView.as_view(), name="api_deposits"),
-    path("deposits/config/", DepositConfigView.as_view(), name="api_deposits_config"),
-]
-
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from rest_framework import status
-
-class GoneView(APIView):
-    authentication_classes = []
-    permission_classes = []
-    def get(self, request, *args, **kwargs):
-        return Response(status=status.HTTP_410_GONE)
-    def post(self, request, *args, **kwargs):
-        return Response(status=status.HTTP_410_GONE)
-    def put(self, request, *args, **kwargs):
-        return Response(status=status.HTTP_410_GONE)
-    def patch(self, request, *args, **kwargs):
-        return Response(status=status.HTTP_410_GONE)
-    def delete(self, request, *args, **kwargs):
-        return Response(status=status.HTTP_410_GONE)
-
-# Neutralize legacy deposit paths
-urlpatterns += [
-    path("deposits/legacy/", GoneView.as_view()),
-    path("wallet/deposits/", GoneView.as_view()),
 ]
