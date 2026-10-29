@@ -25,7 +25,10 @@ DEPOSIT_NETWORKS = [
 def get_available_networks():
     networks = []
     for cfg in DEPOSIT_NETWORKS:
-        addr = os.environ.get(cfg['env_var'], '') or ''
+        # Resolve the same aliases and Django settings as the deposit API.
+        # Render may use the documented VELTRIX_* names rather than the
+        # legacy names in env_var.
+        addr = get_network_address(cfg['key']) or ''
         if addr.strip():
             networks.append({
                 'key': cfg['key'],
@@ -40,6 +43,14 @@ def get_available_networks():
 def get_network_address(key):
     for cfg in DEPOSIT_NETWORKS:
         if cfg['key'] == key:
-            addr = os.environ.get(cfg['env_var'], '') or getattr(__import__('django.conf').conf.settings, cfg['env_var'], '') or ''
+            from django.conf import settings
+            setting_names = {
+                'USDT_TRC20': ('TRON_USDT_RECEIVING_ADDRESS', 'VELTRIX_USDT_TRC20_RECEIVING_ADDRESS'),
+                'USDT_ERC20': ('ETHEREUM_USDT_RECEIVING_ADDRESS', 'VELTRIX_USDT_ERC20_RECEIVING_ADDRESS'),
+                'USDT_BEP20': ('BSC_USDT_RECEIVING_ADDRESS', 'VELTRIX_USDT_BEP20_RECEIVING_ADDRESS'),
+            }
+            addr = os.environ.get(cfg['env_var'], '')
+            for name in setting_names.get(key, ()):
+                addr = addr or getattr(settings, name, '')
             return addr.strip() if addr.strip() else None
     return None
