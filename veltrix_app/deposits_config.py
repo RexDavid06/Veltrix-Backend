@@ -25,9 +25,8 @@ DEPOSIT_NETWORKS = [
 def get_available_networks():
     networks = []
     for cfg in DEPOSIT_NETWORKS:
-        # Resolve the same aliases and Django settings as the deposit API.
-        # Render may use the documented VELTRIX_* names rather than the
-        # legacy names in env_var.
+        # Resolve the configured Render variable first, then Django setting
+        # aliases for deployments that still provide the VELTRIX_* names.
         addr = get_network_address(cfg['key']) or ''
         if addr.strip():
             networks.append({
