@@ -246,6 +246,11 @@ class AdminDepositActionView(APIView):
                 deposit.save(update_fields=['status', 'admin_id', 'reviewed_at', 'updated_at'])
                 AuditLog.objects.create(user=deposit.user, actor=request.user, action='deposit.status_changed', details=json.dumps({"who": request.user.id, "what": "deposit.status", "when": timezone.now().isoformat(), "old": old_status, "new": deposit.status, "reference": deposit.reference}))
                 return Response({'detail': 'Rejected.'})
+            if deposit.method == DepositRequest.Method.CRYPTO:
+                return Response(
+                    {'detail': 'Crypto deposits require independently verified blockchain processing.'},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
             if not verified:
                 return Response({'detail': 'Confirmation required.'}, status=status.HTTP_400_BAD_REQUEST)
             try:
