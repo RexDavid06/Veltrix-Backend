@@ -297,9 +297,10 @@ class DepositConfigAPIView(APIView):
             "deposit_limit_usd": getattr(settings, "DEPOSIT_MIN_USD", 10),
             "min_deposit_usd": getattr(settings, "DEPOSIT_MIN_USD", 10),
             "wallets": [],
-            # Receiving addresses are payment instructions. Keep them hidden
-            # until this deployment can actually accept deposits.
-            "networks": [],
+            # Display configured destinations even when on-chain monitoring
+            # and deposit crediting are disabled. The client labels these as
+            # display-only and never treats a shown address as proof of payment.
+            "networks": get_available_networks(),
             "demo_enabled": False,
             "deposits_enabled": bool(getattr(settings, "FUNDING_DEPOSITS_ENABLED", False)),
             "crypto_mode": getattr(settings, "CRYPTO_DEPOSIT_MODE", "direct_tron"),
@@ -328,13 +329,6 @@ class DepositConfigAPIView(APIView):
                         "live_enabled": live_funding_verified and tron_live_verified,
                         **tron_cfg,
                     }
-                    # Only publish the supported direct TRON destination when
-                    # the same checks used by deposit creation are satisfied.
-                    result["networks"] = [{
-                        "key": "USDT_TRC20",
-                        "label": "USDT (TRC20)",
-                        "address": tron_cfg["address"],
-                    }]
                 elif tron_option_enabled and deposits_enabled and (not live_funding_verified or not tron_live_verified):
                     result["tron"] = {
                         **tron_cfg,
@@ -369,10 +363,11 @@ class DepositConfigAPIView(APIView):
             try:
                 tron = result.get("tron") or {}
                 crypto_enabled = bool(tron.get("enabled", False))
+                addresses_configured = bool(result["networks"])
                 result["methods"].append({
                     "type": "crypto",
                     "enabled": crypto_enabled,
-                    "display_enabled": bool(tron.get("display_enabled", crypto_enabled)),
+                    "display_enabled": addresses_configured or bool(tron.get("display_enabled", crypto_enabled)),
                     "configured": bool(tron.get("configured", False)),
                     "networks": result["networks"],
                 })
