@@ -297,26 +297,14 @@ class DepositConfigAPIView(APIView):
             "deposit_limit_usd": getattr(settings, "DEPOSIT_MIN_USD", 10),
             "min_deposit_usd": getattr(settings, "DEPOSIT_MIN_USD", 10),
             "wallets": [],
+            # Receiving addresses are payment instructions. Keep them hidden
+            # until this deployment can actually accept deposits.
             "networks": [],
             "demo_enabled": False,
             "deposits_enabled": bool(getattr(settings, "FUNDING_DEPOSITS_ENABLED", False)),
             "crypto_mode": getattr(settings, "CRYPTO_DEPOSIT_MODE", "direct_tron"),
             "methods": [],
         }
-        try:
-            nets = []
-            for cfg in DEPOSIT_NETWORKS:
-                addr = get_network_address(cfg['key'])
-                if addr:
-                    nets.append({
-                        'key': cfg['key'],
-                        'label': cfg['label'],
-                        'address': addr,
-                        'env_var': cfg['env_var'],
-                    })
-            result['networks'] = nets
-        except Exception:
-            pass
         try:
             crypto_mode = getattr(settings, "CRYPTO_DEPOSIT_MODE", "direct_tron")
             deposits_enabled = bool(getattr(settings, "FUNDING_DEPOSITS_ENABLED", False))
@@ -340,6 +328,13 @@ class DepositConfigAPIView(APIView):
                         "live_enabled": live_funding_verified and tron_live_verified,
                         **tron_cfg,
                     }
+                    # Only publish the supported direct TRON destination when
+                    # the same checks used by deposit creation are satisfied.
+                    result["networks"] = [{
+                        "key": "USDT_TRC20",
+                        "label": "USDT (TRC20)",
+                        "address": tron_cfg["address"],
+                    }]
                 elif tron_option_enabled and deposits_enabled and (not live_funding_verified or not tron_live_verified):
                     result["tron"] = {
                         **tron_cfg,
@@ -372,14 +367,14 @@ class DepositConfigAPIView(APIView):
             # methods
             result["methods"] = []
             try:
-                networks = result.get("networks") or []
-                crypto_enabled = bool(result.get("tron", {}).get("display_enabled") or (deposits_enabled and tron_option_enabled))
+                tron = result.get("tron") or {}
+                crypto_enabled = bool(tron.get("enabled", False))
                 result["methods"].append({
                     "type": "crypto",
-                    "enabled": bool(result.get("tron", {}).get("enabled") if result.get("tron") else crypto_enabled),
-                    "display_enabled": bool(result.get("tron", {}).get("display_enabled") if result.get("tron") else crypto_enabled),
-                    "configured": bool(result.get("tron", {}).get("configured")) if result.get("tron") else bool(networks),
-                    "networks": networks,
+                    "enabled": crypto_enabled,
+                    "display_enabled": bool(tron.get("display_enabled", crypto_enabled)),
+                    "configured": bool(tron.get("configured", False)),
+                    "networks": result["networks"],
                 })
             except Exception:
                 pass
