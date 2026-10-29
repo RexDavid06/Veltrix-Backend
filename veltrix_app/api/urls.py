@@ -113,7 +113,7 @@ urlpatterns = [
     path("admin/", include("veltrix_app.api.admin_urls")),
 ]
 
-from .deposits import DepositListCreateView, DepositConfigView, DepositConfigAPIView, DepositListCreateAPIView
+from .deposits import DepositListCreateView, DepositConfigView, DepositConfigAPIView, DepositListCreateAPIView, DepositNetworkAddressAPIView
 from .deposits import DepositListCreateView, DepositConfigView, DepositConfigAPIView, DepositListCreateAPIView
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -150,6 +150,7 @@ class BankLegacyView(GoneView):
 
 urlpatterns += [
     path("deposits/", DepositListCreateAPIView.as_view(), name="api_deposits"),
+    path("deposits/networks/<str:network>/address/", DepositNetworkAddressAPIView.as_view(), name="api_deposit_network_address"),
     path("deposits/config/", DepositConfigAPIView.as_view(), name="api_deposit_config"),
     path("deposits/config", DepositConfigAPIView.as_view(), name="api_deposit_config_noslash"),
     path("deposits/bank/", BankLegacyView.as_view(), name="api_bank_deposit_create"),

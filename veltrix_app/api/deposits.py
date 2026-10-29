@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+import re
 
 from django.db import transaction
 from django.utils import timezone
@@ -32,6 +33,32 @@ EXPLORERS = {
     'USDT_ERC20': 'https://etherscan.io/tx/',
     'USDT_BEP20': 'https://bscscan.com/tx/',
 }
+
+NETWORK_ADDRESS_PATTERNS = {
+    'USDT_TRC20': re.compile(r'T[1-9A-HJ-NP-Za-km-z]{33}'),
+    'USDT_ERC20': re.compile(r'0x[a-fA-F0-9]{40}'),
+    'USDT_BEP20': re.compile(r'0x[a-fA-F0-9]{40}'),
+}
+
+
+class DepositNetworkAddressAPIView(APIView):
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request, network):
+        if network not in NETWORK_ADDRESS_PATTERNS:
+            return Response(
+                {'detail': 'Unknown deposit network.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        address = get_network_address(network)
+        if not address or not NETWORK_ADDRESS_PATTERNS[network].fullmatch(address):
+            return Response(
+                {'detail': 'Network address is currently unavailable.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        return Response({'address': address})
 
 
 class DepositConfigView(APIView):
